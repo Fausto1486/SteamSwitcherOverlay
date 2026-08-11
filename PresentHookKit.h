@@ -1,13 +1,40 @@
 #pragma once
 // ═══════════════════════════════════════════════════════════════════════
 // PROJECT STATUS: WORK IN PROGRESS. This is NOT the final state of the
-// overlay. Current SHIPPING configuration is DX11-ONLY (see
-// InstallWorkerThreadProc near the bottom of this file) — DX9 and DX12
-// are both fully implemented but deliberately disabled, pending real
-// testing (DX9) and a real fix for a confirmed, unresolved Steam-overlay
-// crash (DX12). See OVERLAY-REDESIGN-RESULT.md's "FINAL SHIPPING
-// DECISION" section for the complete, current picture before assuming
-// anything about this file's scope or trustworthiness beyond DX11.
+// overlay. Last SHIPPING configuration was DX11-ONLY (see
+// OVERLAY-REDESIGN-RESULT.md's "FINAL SHIPPING DECISION" section). DX12
+// testing resumed in InstallWorkerThreadProc near the bottom of this
+// file. Progress since:
+//   - RE3-DX12 (no Streamline): FIXED and CONFIRMED STABLE, repeatedly,
+//     including real ResizeBuffers events. Original crash
+//     (swapChain::Present() DXGI_ERROR_INVALID_CALL) was
+//     HookedExecuteCommandLists capturing the WRONG D3D12 queue — RE3
+//     uses 3 (COPY/DIRECT/COMPUTE), COPY called first and got captured,
+//     but only DIRECT can execute render commands. Fixed via an
+//     authoritative capture from IDXGIFactory2::CreateSwapChainForHwnd's
+//     pDevice parameter (see DX11::HookedCreateSwapChainForHwnd), with
+//     the old DIRECT-type-filtered ExecuteCommandLists heuristic kept as
+//     a fallback only.
+//   - Daemon X Machina-DX12 + Streamline: STILL BROKEN, separate cause.
+//     The queue-capture fix does NOT resolve it — a confirmed-correct
+//     queue is captured every time, and attach-only (heap/allocator/
+//     fence/ImGui backend/ClaimHwndAndSubclass) survives 18+s reliably.
+//     Real command-list submission crashes it in ~1s, reproducibly
+//     (GPU Crash dump Triggered, sl_interposer in stack — an async
+//     GPU/driver-side fault, not a CPU exception our SEH wrapping can
+//     catch). Likely cause: sl.interposer.dll's own Present/
+//     ExecuteCommandLists hooks chaining with ours — genuinely different,
+//     harder problem than queue selection. The D3D12 debug layer can't
+//     help diagnose it either, since by the time this DLL is
+//     late-injected the game's own device already exists, undebugged.
+//     Streamline gate (RequestAttach's IsStreamlineLoaded check) restored
+//     to active — do NOT bypass it again without new diagnostic evidence,
+//     not another guess.
+// DX9 remains disabled, untested, unrelated to this push. Still open
+// before DX12/RE3-class games are shipping-ready: an explicit
+// fullscreen-transition retest under DX12, and mid-session overlay
+// toggle (INSERT) a few times to rule out a reattach-time regression of
+// the queue-capture fix.
 // ═══════════════════════════════════════════════════════════════════════
 //
 // PresentHookKit.h — D3D9/D3D11/D3D12 hooking + real ImGui rendering for
@@ -114,10 +141,28 @@ namespace PresentHookKit {
         return GetModuleHandleA("sl.interposer.dll") != nullptr;
     }
 
+    // TESTING ONLY — set true to temporarily bypass the Streamline gate
+    // below, to retest Daemon X Machina now that the real DX12 crash cause
+    // (wrong queue captured — see HookedExecuteCommandLists) is fixed. The
+    // gate was always a stopgap, not a real fix, because the Daemon X
+    // Machina crash was never root-caused — Streamline (sl_interposer)
+    // just happened to be in the crash stack, which doesn't rule out the
+    // SAME wrong-queue bug being the actual cause there too, unrelated to
+    // Streamline itself. Currently false — commit-safe checkpoint: RE3
+    // DX12 fix confirmed stable, Daemon X Machina/Streamline still gated
+    // exactly as before. Flip to true only for that specific test session,
+    // and back to false immediately after — do NOT ship with this true.
+    inline bool g_bypassStreamlineGateForTesting = false;
+
     inline void RequestAttach() {
         if (IsStreamlineLoaded()) {
-            Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — refusing to attach overlay. Known crash risk, cause not yet understood. See OVERLAY-REDESIGN-RESULT.md.");
-            return;
+            if (g_bypassStreamlineGateForTesting) {
+                Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — gate BYPASSED for testing (g_bypassStreamlineGateForTesting=true). Attaching anyway to retest against the fixed DX12 queue-capture bug. This is the exact condition that previously crashed — watch closely.");
+            }
+            else {
+                Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — refusing to attach overlay. Known crash risk, cause not yet understood. See OVERLAY-REDESIGN-RESULT.md.");
+                return;
+            }
         }
         g_attachRequested = true;
     }
@@ -382,9 +427,10 @@ namespace PresentHookKit {
         }
     } // namespace DX9
 
-    // DX12 — DISABLED AGAIN, NOT DELETED. See InstallWorkerThreadProc near
-    // the bottom of this file: DX12::Install() is commented out. Full
-    // history (see OVERLAY-REDESIGN-RESULT.md for the complete version):
+    // DX12 — RE-ENABLED FOR TESTING (see InstallWorkerThreadProc near the
+    // bottom of this file, and g_diagnosticSkipRenderSubmission=true
+    // further down in this namespace). Full history (see
+    // OVERLAY-REDESIGN-RESULT.md for the complete version):
     // (1) disabled after Daemon X Machina/Streamline crashed; (2) traced
     // to a Streamline-detection filename typo (checking "sl_interposer.dll"
     // when the real file is "sl.interposer.dll"), fixed, briefly
@@ -407,6 +453,10 @@ namespace PresentHookKit {
     namespace DX12 {
         inline void TryInitAndRender(IDXGISwapChain* swapChain);
         extern volatile bool g_hasCapturedQueue;
+        // Authoritative queue capture — see HookedCreateSwapChainForHwnd's
+        // own comment for why this replaced the old "first queue to call
+        // ExecuteCommandLists" heuristic.
+        inline void OnSwapChainCreationQueueSeen(IUnknown* pDevice);
 
         // Called from the SHARED HookedResizeBuffers (installed via DX11's
         // vtable patch, but — same as Present — fires for DX12 games too).
@@ -626,17 +676,16 @@ namespace PresentHookKit {
         }
 
         inline HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
-            // Heartbeat diagnostic (throttled, once/sec) previously lived
-            // here — used to prove Present was still calling us at all
-            // during the Daemon X Machina/DX12 investigation. Removed:
-            // its purpose is moot now that DX12 is disabled in production
-            // (see the DX12 namespace's own DISABLED marker), and leaving
-            // it active would spam this DLL's log file once/sec forever
-            // during normal DX11 (RE3-style) production use, for zero
-            // benefit there. Re-add if DX12 debugging resumes — the
-            // pattern was: log swapChain/flags/g_imguiInit/g_mainRTV/
-            // g_confirmedNotD3D11/g_renderDisabledAfterFault, throttled to
-            // 1/sec via a static last-logged timestamp.
+            // Heartbeat diagnostic (throttled, once/sec) was here during
+            // the DX12 queue-capture investigation — removed now that the
+            // root cause (wrong queue captured) is found and fixed (see
+            // HookedExecuteCommandLists's own comment) and confirmed
+            // stable across repeated real tests. Was pure log volume with
+            // no further diagnostic value once the bug was understood; re-add
+            // if DX12 debugging resumes on a NEW issue — pattern was: log
+            // swapChain/flags/g_imguiInit/g_mainRTV/g_confirmedNotD3D11/
+            // g_renderDisabledAfterFault (DX11) plus the equivalent DX12
+            // fields, throttled to 1/sec via a static last-logged timestamp.
 
             if (!g_renderDisabledAfterFault && !InTransitionCooldown()) {
                 if (g_confirmedNotD3D11) {
@@ -791,6 +840,56 @@ namespace PresentHookKit {
             }
         }
 
+        // Daemon X Machina (UE5) confirmed to have TWO distinct D3D12
+        // DIRECT-type queues (priority 0 and priority 100) — the old
+        // "first queue to call ExecuteCommandLists" heuristic, even after
+        // being filtered to DIRECT-type-only, can still grab the WRONG one
+        // when a game has more than one. Real DX12 attach still crashed
+        // (GPU Crash dump, sl_interposer in stack) even with a confirmed
+        // DIRECT queue captured — this is why: DIRECT-type alone doesn't
+        // guarantee it's the swapchain's actual presentation queue.
+        //
+        // The reliable source: `pDevice` in
+        // IDXGIFactory2::CreateSwapChainForHwnd IS the presentation queue
+        // for a D3D12 swapchain, by API contract — no ambiguity, no
+        // guessing. Same shared-function-patch approach as Present/
+        // ResizeBuffers (MinHook patches the function's own code, so this
+        // fires for every swapchain creation in the process, D3D9/11/12
+        // alike — harmless no-op QueryInterface failure for non-D3D12
+        // callers, including our own dummy DX11 swapchain below).
+        typedef HRESULT(STDMETHODCALLTYPE* CreateSwapChainForHwnd_t)(
+            IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+            const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+        inline CreateSwapChainForHwnd_t g_origCreateSwapChainForHwnd = nullptr;
+        inline bool g_factoryPatched = false;
+
+        inline HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
+            IDXGIFactory2* factory, IUnknown* pDevice, HWND hWnd,
+            const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+            IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
+        {
+            __try { DX12::OnSwapChainCreationQueueSeen(pDevice); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                Logging::LogFmt("[PresentHookKit] HookedCreateSwapChainForHwnd: faulted inspecting pDevice, continuing to real call anyway.");
+            }
+            if (!g_origCreateSwapChainForHwnd) return DXGI_ERROR_INVALID_CALL;
+            return g_origCreateSwapChainForHwnd(factory, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+        }
+
+        inline void PatchFactoryIfNew(void** vtable) {
+            if (!vtable || g_factoryPatched) return;
+            if (vtable[15] == reinterpret_cast<void*>(&HookedCreateSwapChainForHwnd)) { g_factoryPatched = true; return; }
+            MH_STATUS st = MH_CreateHook(vtable[15], reinterpret_cast<void*>(&HookedCreateSwapChainForHwnd),
+                reinterpret_cast<void**>(&g_origCreateSwapChainForHwnd));
+            if (st == MH_OK && MH_EnableHook(vtable[15]) == MH_OK) {
+                g_factoryPatched = true;
+                Logging::LogFmt("[PresentHookKit] IDXGIFactory2::CreateSwapChainForHwnd hooked via MinHook (vtable[15]) — authoritative DX12 presentation-queue capture enabled.");
+            }
+            else {
+                Logging::LogFmt("[PresentHookKit] PatchFactoryIfNew: MH_CreateHook status=%d on vtable[15]=0x%p", (int)st, vtable[15]);
+            }
+        }
+
         inline bool Install() {
             if (!EnsureMinHookInitialized()) return false;
             IDXGIFactory1* factory1 = nullptr;
@@ -802,6 +901,7 @@ namespace PresentHookKit {
             IDXGIFactory2* factory2 = nullptr;
             factory1->QueryInterface(IID_PPV_ARGS(&factory2));
             if (!factory2) Logging::LogFmt("[PresentHookKit] DX11 Install: QueryInterface(IDXGIFactory2) failed — flip-model swapchain unavailable.");
+            else PatchFactoryIfNew(*reinterpret_cast<void***>(factory2));
 
             D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
             IDXGIAdapter1* adapter = nullptr;
@@ -1081,7 +1181,23 @@ namespace PresentHookKit {
         // DIAGNOSTIC ONLY — set true to isolate whether a crash is caused by
         // capturing the queue/hooking ExecuteCommandLists at all, versus
         // specifically by submitting our own command list on it.
-        inline bool g_diagnosticSkipRenderSubmission = false; // reset to real default — the Streamline gate (RequestAttach) now correctly blocks Streamline games before this point is ever reached, so any DX12 game that DOES get here should render normally
+        //
+        // Confirmed via repeated testing: RE3 (no Streamline) is fully
+        // stable with real submission — that crash was the wrong-queue bug,
+        // now fixed. Daemon X Machina (Streamline present) is NOT fixed by
+        // the same change: attach-only survives 18+s, real submission
+        // crashes in ~1s, reproducibly, with a confirmed-correct queue
+        // both times. Genuinely separate, unresolved cause — likely
+        // sl_interposer.dll's own Present/ExecuteCommandLists hooks
+        // chaining with ours, not a queue-selection problem. GPU Crash
+        // dumps are async driver-side faults, not CPU exceptions our SEH
+        // wrapping can catch, and the D3D12 debug layer can't help either
+        // (game's own device already exists, undebugged, by the time this
+        // DLL is late-injected) — this needs real diagnostic evidence
+        // before touching further, not another guess. Streamline gate
+        // (g_bypassStreamlineGateForTesting, see RequestAttach) restored
+        // to false — production stays gated for Streamline games.
+        inline bool g_diagnosticSkipRenderSubmission = false;
 
         inline void RenderFrameUnsafe(IDXGISwapChain* swapChain) {
             // GetCurrentBackBufferIndex is IDXGISwapChain3+ only.
@@ -1200,13 +1316,81 @@ namespace PresentHookKit {
             }
         }
 
+        // Authoritative queue capture, called from
+        // DX11::HookedCreateSwapChainForHwnd (see that function's own
+        // comment for the full "why"). pDevice IS the presentation queue
+        // by DXGI's own API contract for a D3D12 swapchain — no first-
+        // caller guessing needed. Always wins over the ExecuteCommandLists
+        // fallback below, including overriding an already-captured
+        // heuristic guess, since this source can never be wrong.
+        inline void OnSwapChainCreationQueueSeen(IUnknown* pDevice) {
+            if (!pDevice) return;
+            ID3D12CommandQueue* queue = nullptr;
+            if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return; // not a D3D12 swapchain creation — expected no-op for D3D9/11 games and our own dummy DX11 swapchain
+            if (g_capturedQueue && g_capturedQueue != queue) {
+                Logging::LogFmt("[PresentHookKit] DX12 authoritative queue (0x%p, from CreateSwapChainForHwnd) DIFFERS from previously heuristic-captured queue (0x%p) — overriding with the authoritative one.", queue, g_capturedQueue);
+            }
+            else if (!g_capturedQueue) {
+                Logging::LogFmt("[PresentHookKit] DX12 presentation queue captured from CreateSwapChainForHwnd (authoritative, not a guess): 0x%p", queue);
+            }
+            g_capturedQueue = queue;
+            g_hasCapturedQueue = true;
+            queue->Release(); // raw pointer only, same lifetime assumption already used for the heuristic capture below — the app's own long-lived queue, not ours to own
+        }
+
         inline HRESULT STDMETHODCALLTYPE HookedExecuteCommandLists(
             ID3D12CommandQueue* queue, UINT numLists, ID3D12CommandList* const* lists)
         {
-            if (!g_capturedQueue) {
+            // PERMANENT FIX, confirmed via repeated testing (see
+            // OVERLAY-REDESIGN-RESULT.md): capturing the wrong queue was
+            // the actual cause of the Present()-returns-
+            // DXGI_ERROR_INVALID_CALL crash. This hook is a shared-function
+            // patch (MinHook patches the function's own code, not a
+            // per-instance vtable slot) — it fires for EVERY
+            // ID3D12CommandQueue::ExecuteCommandLists call in the process,
+            // on ANY queue, not just the swapchain's real presentation
+            // queue. RE3-DX12 confirmed to use 3 separate queues (COPY,
+            // DIRECT, COMPUTE) — COPY called first, so the old
+            // capture-whichever-calls-first logic silently latched onto
+            // COPY and submitted our DIRECT-type render commands there,
+            // which a COPY queue cannot execute — corrupting swapchain
+            // state well before Present() itself failed. A DXGI
+            // swapchain's presentation queue is always CreateCommandQueue'd
+            // as D3D12_COMMAND_LIST_TYPE_DIRECT (DXGI requires this), so
+            // reject anything else. Every distinct queue seen is logged
+            // once per session — cheap, keeps every future log
+            // self-documenting (which/how many queues this game uses,
+            // which one got captured) without needing a special diagnostic
+            // build to find out again.
+            {
+                static std::vector<ID3D12CommandQueue*> seenQueues;
+                bool alreadySeen = false;
+                for (auto* q : seenQueues) if (q == queue) { alreadySeen = true; break; }
+                if (!alreadySeen) {
+                    seenQueues.push_back(queue);
+                    D3D12_COMMAND_QUEUE_DESC qd = queue->GetDesc();
+                    const char* typeName = qd.Type == D3D12_COMMAND_LIST_TYPE_DIRECT ? "DIRECT" :
+                        qd.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? "COMPUTE" :
+                        qd.Type == D3D12_COMMAND_LIST_TYPE_COPY ? "COPY" : "OTHER";
+                    Logging::LogFmt("[PresentHookKit] DX12 ExecuteCommandLists: new distinct queue seen: 0x%p type=%s priority=%d (total distinct queues so far: %zu)",
+                        queue, typeName, qd.Priority, seenQueues.size());
+                }
+            }
+
+            // FALLBACK ONLY — see OnSwapChainCreationQueueSeen above,
+            // which is authoritative and always wins when it fires.
+            // Multiple DIRECT-type queues per game (confirmed: Daemon X
+            // Machina/UE5 has two, priority 0 and 100) mean DIRECT-type
+            // filtering alone isn't enough to guarantee the right queue —
+            // that's why this only fills in if the authoritative source
+            // above never fired (e.g. game creates its swapchain before
+            // this DLL's factory hook installs — should be rare given
+            // Install() runs at DLL startup, but kept as a safety net
+            // rather than leaving DX12 with zero queue at all).
+            if (!g_capturedQueue && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
                 g_capturedQueue = queue;
                 g_hasCapturedQueue = true;
-                Logging::LogFmt("[PresentHookKit] DX12 command queue captured.");
+                Logging::LogFmt("[PresentHookKit] DX12 command queue captured via fallback (ExecuteCommandLists first-caller heuristic): 0x%p type=DIRECT", queue);
             }
             return g_origExecuteCommandLists(queue, numLists, lists);
         }
@@ -1388,35 +1572,36 @@ namespace PresentHookKit {
         bool isDX11 = GetModuleHandleA("d3d11.dll") != nullptr;
 
         // ═══════════════════════════════════════════════════════════════
-        // SHIPPING CONFIGURATION: DX11 ONLY.
+        // TESTING CONFIGURATION — NOT THE SHIPPING BUILD.
         //
-        // DX9::Install() and DX12::Install() are both intentionally never
-        // called below — not deleted, both namespaces remain fully
-        // functional (see their own DISABLED markers earlier in this
-        // file). Neither has passed a real, trustworthy production test:
+        // DX12::Install() is re-enabled below to resume the DX12
+        // investigation (see OVERLAY-REDESIGN-RESULT.md, "FINAL SHIPPING
+        // DECISION" and "DX12 re-enable attempt, reverted"). Production
+        // still ships DX11-only until DX12 passes real, repeated tests —
+        // this flag flips back to DX11-only before any real release.
         //
-        //   DX9  — never confirmed firing on any real DX9 game this
-        //          entire session. Not known broken, just genuinely
-        //          untested. Needs a real DX9 game test before shipping.
+        //   DX9  — still disabled. Untested, unrelated to this DX12 push.
         //
-        //   DX12 — actively confirmed broken, twice, for two SEPARATE
-        //          reasons: (1) NVIDIA Streamline present (Daemon X
-        //          Machina) — mitigated via RequestAttach()'s Streamline
-        //          gate, but the underlying crash cause is still not
-        //          understood, just avoided; (2) Steam overlay present,
-        //          NO Streamline involved (RE3's DX12 mode) — completely
-        //          unmitigated, real render submission crashes reliably.
-        //          See OVERLAY-REDESIGN-RESULT.md for the full history.
-        //          Needs its actual root cause fixed — not just gated
-        //          around — before it can ship.
+        //   DX12 — re-enabled for testing, paired with
+        //          g_diagnosticSkipRenderSubmission=true (see that flag's
+        //          own comment) to run next-steps item #1: confirm whether
+        //          DX12 attach-only (heap/allocator/fence creation, no
+        //          command-list submission) survives against RE3-DX12 with
+        //          Steam overlay present and no Streamline. If this
+        //          survives repeated testing, flip
+        //          g_diagnosticSkipRenderSubmission back to false next to
+        //          test real submission. If attach-only itself crashes,
+        //          the bug is in LazyInit's setup calls, not RenderFrame.
         //
-        // DX11 is the only backend confirmed working repeatedly, across
-        // multiple real games, including Steam overlay present and
-        // fullscreen transitions. Ship this configuration until DX9 and
-        // DX12 each get real, passing tests of their own.
+        // DX11 remains installed unconditionally — it's still the only
+        // confirmed-stable backend and DX12 games rely on DX11's Present
+        // hook as their shared frame-boundary signal (see this file's own
+        // header comment).
         // ═══════════════════════════════════════════════════════════════
         if (isDX11) DX11::Install();
-        Logging::LogFmt("[PresentHookKit] Module detection: d3d12=%d d3d11=%d — DX11-only shipping configuration (DX9/DX12 both disabled pending real tests — see comment above).", (int)isDX12, (int)isDX11);
+        if (isDX12) DX12::Install();
+        Logging::LogFmt("[PresentHookKit] Module detection: d3d12=%d d3d11=%d — TESTING config: DX11 always installed, DX12 re-enabled (diagnosticSkipRenderSubmission=%d), DX9 still disabled.",
+            (int)isDX12, (int)isDX11, (int)DX12::g_diagnosticSkipRenderSubmission);
     }
 
     inline void InstallAll() {
