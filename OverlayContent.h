@@ -121,6 +121,23 @@ namespace Overlay {
         // isn't preserved through SharedDataReader's map, so restore it
         // explicitly here instead).
         std::sort(rows.begin(), rows.end(), [](const ModRow& a, const ModRow& b) { return a.modName < b.modName; });
+
+        // "Force Inject ModKit" can leave ModKit.dll resident with zero
+        // mods reporting — nothing in SharedDataReader's per-mod entries
+        // ever reflects that, so the panel showed "No mods injected" with
+        // zero indication ModKit itself was there, and zero visible change
+        // when it was later uninjected (same gap the C# toast-mode panel
+        // had — see ModsPanel.cs's BuildStatusPanelRows). Only synthesized
+        // when there are no real mod rows already; with mods present
+        // ModKit's presence is implied.
+        if (rows.empty() && SharedDataReader::IsModKitPresent()) {
+            ModRow row;
+            row.modName = "ModKit (no mods loaded)";
+            row.clickable = false;
+            row.hooked = true;
+            row.hasActiveFlags = false;
+            rows.push_back(std::move(row));
+        }
         return rows;
     }
 

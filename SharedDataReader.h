@@ -129,4 +129,19 @@ namespace SharedDataReader {
         return true;
     }
 
+    // True if ModKit.dll has loaded in this process. Checks the actual
+    // loaded module directly (GetModuleHandleA — this DLL runs inside the
+    // same process as ModKit.dll, so this is a trivial, reliable,
+    // same-process check) rather than the shared-memory block's
+    // existence. The block is NOT a reliable proxy for "ModKit is
+    // loaded": ModKit.cpp only creates it lazily, inside ModKit_Startup(),
+    // which each individual MOD calls when it registers — with zero mods
+    // (Force Inject ModKit alone), nothing ever calls it, so the mapping
+    // genuinely never exists even though ModKit.dll itself is loaded and
+    // running. Checking the mapping's existence was permanently false in
+    // exactly the scenario this needed to detect.
+    inline bool IsModKitPresent() {
+        return GetModuleHandleA("ModKit.dll") != nullptr;
+    }
+
 } // namespace SharedDataReader
