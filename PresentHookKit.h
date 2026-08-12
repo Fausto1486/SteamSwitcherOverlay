@@ -81,6 +81,7 @@
 #include <d3d9.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <d3d11on12.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
@@ -141,28 +142,30 @@ namespace PresentHookKit {
         return GetModuleHandleA("sl.interposer.dll") != nullptr;
     }
 
-    // TESTING ONLY — set true to temporarily bypass the Streamline gate
-    // below, to retest Daemon X Machina now that the real DX12 crash cause
-    // (wrong queue captured — see HookedExecuteCommandLists) is fixed. The
-    // gate was always a stopgap, not a real fix, because the Daemon X
-    // Machina crash was never root-caused — Streamline (sl_interposer)
-    // just happened to be in the crash stack, which doesn't rule out the
-    // SAME wrong-queue bug being the actual cause there too, unrelated to
-    // Streamline itself. Currently false — commit-safe checkpoint: RE3
-    // DX12 fix confirmed stable, Daemon X Machina/Streamline still gated
-    // exactly as before. Flip to true only for that specific test session,
-    // and back to false immediately after — do NOT ship with this true.
-    inline bool g_bypassStreamlineGateForTesting = false;
+    // Safety switch only — flip true to instantly restore the old
+    // unconditional refuse-on-Streamline behavior if the D3D12 D3D11On12
+    // branch (DX12::g_usingD3D11On12, decided per-attach in
+    // DX12::LazyInit — see that namespace's own header comment) turns out
+    // not to fix the Daemon X Machina crash after all and needs isolating
+    // again. Default false: DX12 now selects the D3D11On12 render path
+    // automatically whenever Streamline is loaded, so there's no known
+    // reason left to refuse attaching outright.
+    inline bool g_refuseAttachOnStreamlineForTesting = false;
 
     inline void RequestAttach() {
+        // Idempotent — g_attachRequested never resets once true (nothing
+        // in this file ever sets it back to false), so every call after
+        // the first is a pure no-op. Called from every INSERT press,
+        // every SETMODCHANNEL enable, and every toast — without this
+        // early return the Streamline log line below fired once per call
+        // instead of once per session.
+        if (g_attachRequested) return;
         if (IsStreamlineLoaded()) {
-            if (g_bypassStreamlineGateForTesting) {
-                Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — gate BYPASSED for testing (g_bypassStreamlineGateForTesting=true). Attaching anyway to retest against the fixed DX12 queue-capture bug. This is the exact condition that previously crashed — watch closely.");
-            }
-            else {
-                Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — refusing to attach overlay. Known crash risk, cause not yet understood. See OVERLAY-REDESIGN-RESULT.md.");
+            if (g_refuseAttachOnStreamlineForTesting) {
+                Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — g_refuseAttachOnStreamlineForTesting=true, refusing to attach.");
                 return;
             }
+            Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — attaching anyway. DX12 will select its D3D11On12 render path instead of the native ImGui_ImplDX12 path once it attaches (see DX12::LazyInit).");
         }
         g_attachRequested = true;
     }
@@ -427,25 +430,16 @@ namespace PresentHookKit {
         }
     } // namespace DX9
 
-    // DX12 — RE-ENABLED FOR TESTING (see InstallWorkerThreadProc near the
-    // bottom of this file, and g_diagnosticSkipRenderSubmission=true
-    // further down in this namespace). Full history (see
-    // OVERLAY-REDESIGN-RESULT.md for the complete version):
-    // (1) disabled after Daemon X Machina/Streamline crashed; (2) traced
-    // to a Streamline-detection filename typo (checking "sl_interposer.dll"
-    // when the real file is "sl.interposer.dll"), fixed, briefly
-    // RE-enabled believing the Streamline gate alone made DX12 safe;
-    // (3) DIRECTLY DISPROVEN — RE3's DX12 mode (confirmed via module dump:
-    // NO Streamline present at all) crashed against STEAM's own overlay
-    // (gameoverlayrenderer64.dll, 0xC0000005) a few seconds into ordinary
-    // rendering, no special trigger. This is a genuinely different,
-    // previously-untested collision: every prior DX12 test had either the
-    // Streamline gate blocking before attach, or render submission
-    // deliberately skipped — this was the first real end-to-end DX12
-    // render test with Steam overlay present, and it crashed. The
-    // Streamline gate does nothing for this, since Streamline was never
-    // involved. DX12 rendering itself has a real, unresolved Steam-overlay
-    // bug independent of everything else investigated this session.
+    // DX12 has TWO render paths, selected per-attach (DX12::g_usingD3D11On12,
+    // decided in DX12::LazyInit): native ImGui_ImplDX12 by default (RE3-
+    // proven, unchanged), and D3D11On12 only when Streamline is loaded.
+    // See the DX12 namespace's own header comment for the full technical
+    // reasoning on why the native path collides with Streamline (confirmed:
+    // GPU crash dump, sl_interposer.dll in the stack, attach-only survived
+    // 18+s but real ExecuteCommandLists submission crashed in ~1s) and why
+    // D3D11On12 avoids it (confirmed via disassembly of
+    // gameoverlayrenderer64.dll that Steam's own D3D12 overlay uses the
+    // same technique, and never hooks ExecuteCommandLists at all).
     //
     // Forward declaration — DX11::HookedPresent falls through to this when
     // its own D3D11 device acquisition fails, per this file's own header
@@ -868,6 +862,7 @@ namespace PresentHookKit {
             const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
             IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
         {
+            Logging::LogFmt("[PresentHookKit] HookedCreateSwapChainForHwnd called. factory=0x%p pDevice=0x%p hWnd=0x%p", factory, pDevice, hWnd);
             __try { DX12::OnSwapChainCreationQueueSeen(pDevice); }
             __except (EXCEPTION_EXECUTE_HANDLER) {
                 Logging::LogFmt("[PresentHookKit] HookedCreateSwapChainForHwnd: faulted inspecting pDevice, continuing to real call anyway.");
@@ -987,12 +982,106 @@ namespace PresentHookKit {
 
         inline bool g_imguiInit = false;
         inline bool g_renderDisabledAfterFault = false;
-        inline bool g_attachPermanentlyAborted = false; // set once ClaimHwndAndSubclass refuses — see DX9's identical flag. CRITICAL here specifically: without this, every frame rebuilds the FULL DX12 state (descriptor heaps, command allocators/list, fence, ImGui backend) from scratch, fails, tears it all down via Uninstall(), and repeats — 60x/sec of real GPU-adjacent resource churn, not just a log spam annoyance.
+        inline bool g_attachPermanentlyAborted = false; // set once ClaimHwndAndSubclass refuses — see DX9's identical flag.
         inline ID3D12Device* g_device = nullptr; // borrowed from the swapchain, never Release()'d beyond our own AddRef
 
-        struct FrameContext { ID3D12CommandAllocator* allocator = nullptr; UINT64 fenceValue = 0; };
-        inline std::vector<FrameContext> g_frameContexts;
-        inline std::vector<ID3D12Resource*> g_backBuffers;
+        // Decided ONCE per attach, in LazyInit — never changes mid-session.
+        // false (native ImGui_ImplDX12 path) is the default and is what RE3
+        // uses in both DX11 and DX12 mode, proven stable — this path is
+        // UNCHANGED from before the Daemon X Machina investigation. true
+        // (D3D11On12 path, below) only engages when Streamline is actually
+        // loaded, since that's the one case the native path's direct
+        // ExecuteCommandLists submission collides with (confirmed: attach-
+        // only survived 18+s, real submission crashed in ~1s on Daemon X
+        // Machina specifically). See this namespace's two Uninstall/Render
+        // branches — both paths are compiled in and coexist; only one runs
+        // per session.
+        inline bool g_usingD3D11On12 = false;
+
+        // Set true only by OnSwapChainCreationQueueSeen (the authoritative
+        // capture) — used by LazyInit to decide whether it's safe to trust
+        // g_capturedQueue for D3D11On12, or whether it's still just the
+        // ExecuteCommandLists first-caller heuristic guess (ambiguous when
+        // multiple real DIRECT-type queues exist, as on Daemon X Machina).
+        // CONFIRMED never fires for Daemon X Machina — its real swapchain
+        // is created before this DLL is injected, so HookedCreateSwapChainForHwnd
+        // only ever sees unrelated (Steam-internal) swapchain creations.
+        // See g_queueResolutionAttempted below for the fallback this feeds.
+        inline bool g_queueCaptureIsAuthoritative = false;
+
+        // ── Present-correlation queue resolution (Streamline-only fallback) ─
+        // When authoritative capture is structurally unavailable (confirmed
+        // above), the real presentation queue still has one observable
+        // property the wrong queue doesn't: its ExecuteCommandLists call
+        // lands immediately before each real Present, every frame. Track
+        // every distinct DIRECT-type queue's last ExecuteCommandLists
+        // timestamp; on each real Present, whichever queue fired most
+        // recently gets a point. After enough frames, the queue with the
+        // most points is almost certainly the real one — a real signal,
+        // not a guess, but still probabilistic, unlike authoritative
+        // capture. If no candidate ever correlates, refuse rather than
+        // pick arbitrarily.
+        struct DirectQueueCandidate {
+            ID3D12CommandQueue* queue = nullptr;
+            std::chrono::steady_clock::time_point lastExecTime{};
+            int correlationScore = 0;
+        };
+        inline std::vector<DirectQueueCandidate> g_directQueueCandidates;
+        inline int g_correlationFramesObserved = 0;
+        constexpr int kCorrelationFrameTarget = 90; // ~1.5s at 60fps — generous enough to be confident, short enough not to feel stuck
+        inline bool g_queueResolutionAttempted = false;  // true once correlation has either succeeded or given up
+        inline bool g_queueResolvedSuccessfully = false; // true only if a real candidate won
+
+        inline void RecordExecuteCommandListsForCorrelation(ID3D12CommandQueue* queue) {
+            auto now = std::chrono::steady_clock::now();
+            for (auto& c : g_directQueueCandidates) {
+                if (c.queue == queue) { c.lastExecTime = now; return; }
+            }
+            g_directQueueCandidates.push_back({ queue, now, 0 });
+        }
+
+        // Called once per real Present (from TryInitAndRender, every frame,
+        // only while resolution is still pending) — this IS the correlation
+        // signal itself: whichever queue's ExecuteCommandLists landed most
+        // recently before THIS Present gets a point.
+        inline void RecordPresentForCorrelation() {
+            if (g_queueResolutionAttempted) return;
+            auto now = std::chrono::steady_clock::now();
+            DirectQueueCandidate* best = nullptr;
+            std::chrono::steady_clock::duration bestDelta{};
+            for (auto& c : g_directQueueCandidates) {
+                if (c.lastExecTime.time_since_epoch().count() == 0) continue; // never fired yet
+                auto delta = now - c.lastExecTime;
+                if (delta < std::chrono::milliseconds(0)) continue; // clock oddity guard
+                if (!best || delta < bestDelta) { best = &c; bestDelta = delta; }
+            }
+            if (best && bestDelta < std::chrono::milliseconds(8)) {
+                best->correlationScore++;
+            }
+
+            if (++g_correlationFramesObserved >= kCorrelationFrameTarget) {
+                DirectQueueCandidate* winner = nullptr;
+                for (auto& c : g_directQueueCandidates) {
+                    if (!winner || c.correlationScore > winner->correlationScore) winner = &c;
+                }
+                g_queueResolutionAttempted = true;
+                if (winner && winner->correlationScore > 0) {
+                    Logging::LogFmt("[PresentHookKit] DX12 queue resolved via Present-correlation: 0x%p score=%d/%d across %zu candidate(s).",
+                        winner->queue, winner->correlationScore, g_correlationFramesObserved, g_directQueueCandidates.size());
+                    g_capturedQueue = winner->queue;
+                    g_queueResolvedSuccessfully = true;
+                }
+                else {
+                    Logging::LogFmt("[PresentHookKit] DX12 queue correlation inconclusive after %d frames (%zu candidate(s), no queue ever correlated with Present) — refusing to attach rather than guess.",
+                        g_correlationFramesObserved, g_directQueueCandidates.size());
+                }
+            }
+        }
+
+        inline std::vector<ID3D12Resource*> g_backBuffers; // raw D3D12 backbuffers — shared by both paths (native path RTVs them directly; D3D11On12 path wraps them)
+        inline UINT g_bufferCount = 0;
+
+        // ── Native ImGui_ImplDX12 path state (default; RE3-proven) ─────────
         inline ID3D12DescriptorHeap* g_rtvHeap = nullptr;
         inline UINT g_rtvDescriptorSize = 0;
         inline ID3D12DescriptorHeap* g_srvHeap = nullptr;
@@ -1000,11 +1089,13 @@ namespace PresentHookKit {
         inline ID3D12Fence* g_fence = nullptr;
         inline UINT64 g_fenceLastSignaled = 0;
         inline HANDLE g_fenceEvent = nullptr;
-        inline UINT g_bufferCount = 0;
 
-        // ── Minimal free-list SRV descriptor allocator for ImGui_ImplDX12's
+        struct FrameContext { ID3D12CommandAllocator* allocator = nullptr; UINT64 fenceValue = 0; };
+        inline std::vector<FrameContext> g_frameContexts;
+
+        // Minimal free-list SRV descriptor allocator for ImGui_ImplDX12's
         // dynamic-texture callbacks (font atlas + any runtime textures the
-        // 1.92.x backend allocates — see handover doc §4's note on this). ────
+        // 1.92.x backend allocates).
         inline std::vector<UINT> g_srvFreeList;
         inline UINT g_srvDescriptorSize = 0;
         constexpr UINT kSrvHeapCapacity = 64;
@@ -1026,7 +1117,25 @@ namespace PresentHookKit {
             g_srvFreeList.push_back(index);
         }
 
+        // ── D3D11On12 path state (Streamline-only) ──────────────────────────
+        // See g_usingD3D11On12's own comment above for when this engages.
+        // Confirmed via disassembly of gameoverlayrenderer64.dll that
+        // Steam's own D3D12 overlay uses exactly this technique
+        // (CD3D12Renderer::ValveTakeScreenshot's D3D11On12CreateDevice call)
+        // and never hooks ExecuteCommandLists at all — command-list
+        // submission happens inside Microsoft's D3D11on12 runtime, not via
+        // a direct call of ours into the function Streamline also hooks.
+        inline ID3D11On12Device* g_d3d11on12Device = nullptr;
+        inline ID3D11Device* g_d3d11Device = nullptr;
+        inline ID3D11DeviceContext* g_d3d11Context = nullptr;
+        inline std::vector<ID3D11Resource*> g_wrappedBackBuffers; // D3D11On12-wrapped view of g_backBuffers
+        inline std::vector<ID3D11RenderTargetView*> g_rtvsD3D11On12;
+
         inline void ReleaseBackBuffers() {
+            for (auto* rtv : g_rtvsD3D11On12) if (rtv) rtv->Release();
+            g_rtvsD3D11On12.clear();
+            for (auto* wb : g_wrappedBackBuffers) if (wb) wb->Release();
+            g_wrappedBackBuffers.clear();
             for (auto* b : g_backBuffers) if (b) b->Release();
             g_backBuffers.clear();
         }
@@ -1036,6 +1145,22 @@ namespace PresentHookKit {
             g_bufferCount = desc.BufferCount;
             g_backBuffers.resize(g_bufferCount, nullptr);
 
+            if (g_usingD3D11On12) {
+                g_wrappedBackBuffers.resize(g_bufferCount, nullptr);
+                g_rtvsD3D11On12.resize(g_bufferCount, nullptr);
+                D3D11_RESOURCE_FLAGS resFlags = { D3D11_BIND_RENDER_TARGET };
+                for (UINT i = 0; i < g_bufferCount; ++i) {
+                    if (FAILED(swapChain->GetBuffer(i, IID_PPV_ARGS(&g_backBuffers[i])))) return false;
+                    if (FAILED(g_d3d11on12Device->CreateWrappedResource(
+                        g_backBuffers[i], &resFlags,
+                        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT,
+                        IID_PPV_ARGS(&g_wrappedBackBuffers[i])))) return false;
+                    if (FAILED(g_d3d11Device->CreateRenderTargetView(g_wrappedBackBuffers[i], nullptr, &g_rtvsD3D11On12[i]))) return false;
+                }
+                return true;
+            }
+
+            // Native path — unchanged from the RE3-proven original.
             if (!g_rtvHeap) {
                 D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {};
                 rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -1044,7 +1169,6 @@ namespace PresentHookKit {
                 if (FAILED(g_device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&g_rtvHeap)))) return false;
                 g_rtvDescriptorSize = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
             }
-
             D3D12_CPU_DESCRIPTOR_HANDLE rtvStart = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
             for (UINT i = 0; i < g_bufferCount; ++i) {
                 if (FAILED(swapChain->GetBuffer(i, IID_PPV_ARGS(&g_backBuffers[i])))) return false;
@@ -1056,7 +1180,7 @@ namespace PresentHookKit {
         }
 
         // Called only from DX11::HookedPresent's fallback path — see this
-        // file's header comment. `swapChain` here is the REAL game
+        // file's own header comment. `swapChain` here is the REAL game
         // swapchain, not a dummy; Install() below never touches it.
         inline void Uninstall(); // forward decl — LazyInit reuses this for cleanup on a ClaimHwndAndSubclass abort
 
@@ -1082,6 +1206,56 @@ namespace PresentHookKit {
 
             g_device = device; // keep our own ref; released in Uninstall
 
+            // Streamline needs the D3D11On12 path, which needs the EXACT
+            // real presentation queue — a wrong queue is the same class of
+            // bug that already caused a GPU crash once (RE3's original
+            // wrong-queue bug). Authoritative CreateSwapChainForHwnd
+            // capture is CONFIRMED unavailable for this game (its real
+            // swapchain is created before injection) — RecordPresentForCorrelation
+            // (called every frame from TryInitAndRender while this is
+            // pending) resolves the real queue via Present-timing
+            // correlation instead. Wait for that to finish rather than
+            // guess; if it can't resolve anything, refuse rather than pick
+            // arbitrarily.
+            if (IsStreamlineLoaded() && !g_queueCaptureIsAuthoritative) {
+                if (!g_queueResolutionAttempted) {
+                    static bool loggedWaitOnce = false;
+                    if (!loggedWaitOnce) {
+                        Logging::LogFmt("[PresentHookKit] DX12 LazyInit: Streamline present, queue not yet resolved via Present-correlation — waiting rather than guessing.");
+                        loggedWaitOnce = true;
+                    }
+                    Uninstall(); // releases g_device (just assigned above) and resets state; not a permanent abort — retry next frame
+                    return;
+                }
+                if (!g_queueResolvedSuccessfully) {
+                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: Streamline present, Present-correlation could not resolve the real queue — refusing to attach rather than guess a possibly-wrong queue into D3D11On12CreateDevice.");
+                    g_attachPermanentlyAborted = true;
+                    Uninstall();
+                    return;
+                }
+                // else: RecordPresentForCorrelation already set g_capturedQueue
+                // to the resolved winner — fall through and use it below.
+            }
+
+            g_usingD3D11On12 = IsStreamlineLoaded();
+
+            if (g_usingD3D11On12) {
+                IUnknown* queues[] = { g_capturedQueue };
+                if (FAILED(D3D11On12CreateDevice(g_device, 0, nullptr, 0, queues, 1, 0,
+                    &g_d3d11Device, &g_d3d11Context, nullptr))) {
+                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: D3D11On12CreateDevice failed — aborting permanently, not retrying every frame.");
+                    g_attachPermanentlyAborted = true;
+                    Uninstall();
+                    return;
+                }
+                if (FAILED(g_d3d11Device->QueryInterface(IID_PPV_ARGS(&g_d3d11on12Device)))) {
+                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: QueryInterface(ID3D11On12Device) failed — aborting permanently, not retrying every frame.");
+                    g_attachPermanentlyAborted = true;
+                    Uninstall();
+                    return;
+                }
+            }
+
             if (!CreateBackBuffersAndRTVs(swapChain, desc)) {
                 Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateBackBuffersAndRTVs failed — aborting permanently, not retrying every frame.");
                 g_attachPermanentlyAborted = true;
@@ -1089,52 +1263,54 @@ namespace PresentHookKit {
                 return;
             }
 
-            D3D12_DESCRIPTOR_HEAP_DESC srvDesc = {};
-            srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            srvDesc.NumDescriptors = kSrvHeapCapacity;
-            srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            if (FAILED(g_device->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&g_srvHeap)))) {
-                Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateDescriptorHeap (SRV) failed — aborting permanently, not retrying every frame.");
-                g_attachPermanentlyAborted = true;
-                Uninstall();
-                return;
-            }
-            g_srvDescriptorSize = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            g_srvFreeList.clear();
-            for (UINT i = 0; i < kSrvHeapCapacity; ++i) g_srvFreeList.push_back(i);
-
-            g_frameContexts.resize(g_bufferCount);
-            bool allocatorsOk = true;
-            for (auto& fc : g_frameContexts) {
-                if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&fc.allocator)))) {
-                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateCommandAllocator failed — aborting permanently, not retrying every frame.");
-                    allocatorsOk = false;
-                    break;
+            if (!g_usingD3D11On12) {
+                D3D12_DESCRIPTOR_HEAP_DESC srvDesc = {};
+                srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                srvDesc.NumDescriptors = kSrvHeapCapacity;
+                srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                if (FAILED(g_device->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&g_srvHeap)))) {
+                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateDescriptorHeap (SRV) failed — aborting permanently, not retrying every frame.");
+                    g_attachPermanentlyAborted = true;
+                    Uninstall();
+                    return;
                 }
-            }
-            if (!allocatorsOk) { g_attachPermanentlyAborted = true; Uninstall(); return; }
+                g_srvDescriptorSize = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                g_srvFreeList.clear();
+                for (UINT i = 0; i < kSrvHeapCapacity; ++i) g_srvFreeList.push_back(i);
 
-            if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                g_frameContexts[0].allocator, nullptr, IID_PPV_ARGS(&g_commandList)))) {
-                Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateCommandList failed — aborting permanently, not retrying every frame.");
-                g_attachPermanentlyAborted = true;
-                Uninstall();
-                return;
-            }
-            g_commandList->Close();
+                g_frameContexts.resize(g_bufferCount);
+                bool allocatorsOk = true;
+                for (auto& fc : g_frameContexts) {
+                    if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&fc.allocator)))) {
+                        Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateCommandAllocator failed — aborting permanently, not retrying every frame.");
+                        allocatorsOk = false;
+                        break;
+                    }
+                }
+                if (!allocatorsOk) { g_attachPermanentlyAborted = true; Uninstall(); return; }
 
-            if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) {
-                Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateFence failed — aborting permanently, not retrying every frame.");
-                g_attachPermanentlyAborted = true;
-                Uninstall();
-                return;
-            }
-            g_fenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-            if (!g_fenceEvent) {
-                Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateEventA failed — aborting permanently, not retrying every frame.");
-                g_attachPermanentlyAborted = true;
-                Uninstall();
-                return;
+                if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    g_frameContexts[0].allocator, nullptr, IID_PPV_ARGS(&g_commandList)))) {
+                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateCommandList failed — aborting permanently, not retrying every frame.");
+                    g_attachPermanentlyAborted = true;
+                    Uninstall();
+                    return;
+                }
+                g_commandList->Close();
+
+                if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) {
+                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateFence failed — aborting permanently, not retrying every frame.");
+                    g_attachPermanentlyAborted = true;
+                    Uninstall();
+                    return;
+                }
+                g_fenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+                if (!g_fenceEvent) {
+                    Logging::LogFmt("[PresentHookKit] DX12 LazyInit: CreateEventA failed — aborting permanently, not retrying every frame.");
+                    g_attachPermanentlyAborted = true;
+                    Uninstall();
+                    return;
+                }
             }
 
             EnsureImGuiContext();
@@ -1146,16 +1322,23 @@ namespace PresentHookKit {
             }
             g_win32BackendActive = true;
 
-            ImGui_ImplDX12_InitInfo initInfo = {};
-            initInfo.Device = g_device;
-            initInfo.CommandQueue = g_capturedQueue;
-            initInfo.NumFramesInFlight = static_cast<int>(g_bufferCount);
-            initInfo.RTVFormat = desc.BufferDesc.Format;
-            initInfo.SrvDescriptorHeap = g_srvHeap;
-            initInfo.SrvDescriptorAllocFn = &SrvAlloc;
-            initInfo.SrvDescriptorFreeFn = &SrvFree;
-            if (!ImGui_ImplDX12_Init(&initInfo)) {
-                Logging::LogFmt("[PresentHookKit] DX12 LazyInit: ImGui_ImplDX12_Init failed — aborting permanently, not retrying every frame.");
+            bool imguiBackendOk;
+            if (g_usingD3D11On12) {
+                imguiBackendOk = ImGui_ImplDX11_Init(g_d3d11Device, g_d3d11Context);
+            }
+            else {
+                ImGui_ImplDX12_InitInfo initInfo = {};
+                initInfo.Device = g_device;
+                initInfo.CommandQueue = g_capturedQueue;
+                initInfo.NumFramesInFlight = static_cast<int>(g_bufferCount);
+                initInfo.RTVFormat = desc.BufferDesc.Format;
+                initInfo.SrvDescriptorHeap = g_srvHeap;
+                initInfo.SrvDescriptorAllocFn = &SrvAlloc;
+                initInfo.SrvDescriptorFreeFn = &SrvFree;
+                imguiBackendOk = ImGui_ImplDX12_Init(&initInfo);
+            }
+            if (!imguiBackendOk) {
+                Logging::LogFmt("[PresentHookKit] DX12 LazyInit: ImGui backend init failed (%s) — aborting permanently, not retrying every frame.", g_usingD3D11On12 ? "DX11" : "DX12");
                 g_attachPermanentlyAborted = true;
                 ImGui_ImplWin32_Shutdown(); g_win32BackendActive = false;
                 Uninstall();
@@ -1165,12 +1348,13 @@ namespace PresentHookKit {
             if (!ClaimHwndAndSubclass(desc.OutputWindow)) {
                 Logging::LogFmt("[PresentHookKit] DX12 attach aborted — ClaimHwndAndSubclass refused. Not retrying this session.");
                 g_attachPermanentlyAborted = true;
-                Uninstall(); // full teardown — descriptor heaps, command list, allocators, fence, backbuffers, device, ImGui backends
+                Uninstall(); // full teardown — heaps/command list/fence (native) or wrapped resources/D3D11On12 device (Streamline), backbuffers, device, ImGui backends
                 return;
             }
             g_imguiInit = true;
             DX11::EnsureResizeHook(*reinterpret_cast<void***>(swapChain));
-            Logging::LogFmt("[PresentHookKit] Overlay attached via D3D12 (ExecuteCommandLists + DX11-Present frame signal).");
+            Logging::LogFmt("[PresentHookKit] Overlay attached via D3D12 (%s render path + DX11-Present frame signal).",
+                g_usingD3D11On12 ? "D3D11On12, Streamline detected" : "native ImGui_ImplDX12");
         }
 
         inline bool TryLazyInit(IDXGISwapChain* swapChain) {
@@ -1178,33 +1362,38 @@ namespace PresentHookKit {
             __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
         }
 
-        // DIAGNOSTIC ONLY — set true to isolate whether a crash is caused by
-        // capturing the queue/hooking ExecuteCommandLists at all, versus
-        // specifically by submitting our own command list on it.
-        //
-        // Confirmed via repeated testing: RE3 (no Streamline) is fully
-        // stable with real submission — that crash was the wrong-queue bug,
-        // now fixed. Daemon X Machina (Streamline present) is NOT fixed by
-        // the same change: attach-only survives 18+s, real submission
-        // crashes in ~1s, reproducibly, with a confirmed-correct queue
-        // both times. Genuinely separate, unresolved cause — likely
-        // sl_interposer.dll's own Present/ExecuteCommandLists hooks
-        // chaining with ours, not a queue-selection problem. GPU Crash
-        // dumps are async driver-side faults, not CPU exceptions our SEH
-        // wrapping can catch, and the D3D12 debug layer can't help either
-        // (game's own device already exists, undebugged, by the time this
-        // DLL is late-injected) — this needs real diagnostic evidence
-        // before touching further, not another guess. Streamline gate
-        // (g_bypassStreamlineGateForTesting, see RequestAttach) restored
-        // to false — production stays gated for Streamline games.
-        inline bool g_diagnosticSkipRenderSubmission = false;
-
         inline void RenderFrameUnsafe(IDXGISwapChain* swapChain) {
             // GetCurrentBackBufferIndex is IDXGISwapChain3+ only.
             IDXGISwapChain3* sc3 = nullptr;
             if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return;
             UINT backBufferIndex = sc3->GetCurrentBackBufferIndex();
             sc3->Release();
+
+            if (g_usingD3D11On12) {
+                if (backBufferIndex >= g_wrappedBackBuffers.size()) return;
+
+                ID3D11Resource* wrapped = g_wrappedBackBuffers[backBufferIndex];
+                g_d3d11on12Device->AcquireWrappedResources(&wrapped, 1);
+                g_d3d11Context->OMSetRenderTargets(1, &g_rtvsD3D11On12[backBufferIndex], nullptr);
+
+                ImGui_ImplDX11_NewFrame();
+                ImGui_ImplWin32_NewFrame();
+                ImGui::NewFrame();
+                Overlay::DrawOverlay();
+                ImGui::EndFrame();
+                ImGui::Render();
+                ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+                // ReleaseWrappedResources + Flush submits through
+                // D3D11on12's own internal queue submission — inside
+                // Microsoft's runtime code, not a direct call of ours into
+                // the hooked ExecuteCommandLists.
+                g_d3d11on12Device->ReleaseWrappedResources(&wrapped, 1);
+                g_d3d11Context->Flush();
+                return;
+            }
+
+            // Native path — unchanged from the RE3-proven original.
             if (backBufferIndex >= g_frameContexts.size()) return;
 
             FrameContext& fc = g_frameContexts[backBufferIndex];
@@ -1236,11 +1425,6 @@ namespace PresentHookKit {
             ImGui::EndFrame();
             ImGui::Render();
 
-            if (g_diagnosticSkipRenderSubmission) {
-                g_commandList->Close();
-                return;
-            }
-
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_commandList);
 
             D3D12_RESOURCE_BARRIER toPresent = toRT;
@@ -1254,6 +1438,10 @@ namespace PresentHookKit {
             // function's own code, not just the vtable slot, so any call
             // reaching that address goes through our hook regardless of how
             // it's invoked). Harmless either way, but this is more direct.
+            // Only reached when g_usingD3D11On12 is false, i.e. Streamline
+            // is not loaded — this is the exact call that collides with
+            // Streamline's own hook when it IS loaded, which is why that
+            // case takes the D3D11On12 branch above instead.
             ID3D12CommandList* lists[] = { g_commandList };
             g_origExecuteCommandLists(g_capturedQueue, 1, lists);
 
@@ -1267,13 +1455,15 @@ namespace PresentHookKit {
         }
 
         inline void PrepareForResize() {
-            if (g_backBuffers.empty() && !g_rtvHeap) return; // never attached, or already cleaned up — cheap no-op
+            if (g_backBuffers.empty() && !g_rtvHeap && g_wrappedBackBuffers.empty()) return; // never attached, or already cleaned up — cheap no-op
 
             // Wait for the GPU to actually finish with these buffers, not
             // just drop our CPU-side references — releasing while the GPU
             // still has in-flight work reading/writing them is a separate,
             // worse problem than the one this function exists to fix.
-            if (g_fence && g_fenceEvent && g_fenceLastSignaled > 0 &&
+            // Only the native path owns a fence; D3D11On12's Flush() already
+            // handles its own synchronization per-frame.
+            if (!g_usingD3D11On12 && g_fence && g_fenceEvent && g_fenceLastSignaled > 0 &&
                 g_fence->GetCompletedValue() < g_fenceLastSignaled) {
                 g_fence->SetEventOnCompletion(g_fenceLastSignaled, g_fenceEvent);
                 WaitForSingleObject(g_fenceEvent, 2000); // bounded — never hang the game's own resize call indefinitely
@@ -1296,6 +1486,16 @@ namespace PresentHookKit {
         inline void TryInitAndRender(IDXGISwapChain* swapChain) {
             if (g_renderDisabledAfterFault || g_attachPermanentlyAborted) return;
             if (!PresentHookKit::g_attachRequested) return; // delayed attach — see g_attachRequested's own comment
+
+            // Feeds the Present-correlation queue resolution used by
+            // LazyInit's Streamline branch (see that block's own comment).
+            // No-ops once resolution has already succeeded or given up, or
+            // if this isn't a Streamline session at all — cheap to call
+            // unconditionally every frame otherwise.
+            if (!g_imguiInit && IsStreamlineLoaded() && !g_queueCaptureIsAuthoritative) {
+                RecordPresentForCorrelation();
+            }
+
             if (!g_imguiInit) {
                 if (!TryLazyInit(swapChain)) {
                     g_renderDisabledAfterFault = true;
@@ -1321,47 +1521,37 @@ namespace PresentHookKit {
         // comment for the full "why"). pDevice IS the presentation queue
         // by DXGI's own API contract for a D3D12 swapchain — no first-
         // caller guessing needed. Always wins over the ExecuteCommandLists
-        // fallback below, including overriding an already-captured
-        // heuristic guess, since this source can never be wrong.
+        // heuristic below if both fire.
         inline void OnSwapChainCreationQueueSeen(IUnknown* pDevice) {
-            if (!pDevice) return;
             ID3D12CommandQueue* queue = nullptr;
-            if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return; // not a D3D12 swapchain creation — expected no-op for D3D9/11 games and our own dummy DX11 swapchain
+            if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) {
+                Logging::LogFmt("[PresentHookKit] DX12 OnSwapChainCreationQueueSeen: pDevice (0x%p) did NOT QueryInterface to ID3D12CommandQueue — hook fired, but this call's pDevice isn't the queue we expected.", pDevice);
+                return;
+            }
             if (g_capturedQueue && g_capturedQueue != queue) {
                 Logging::LogFmt("[PresentHookKit] DX12 authoritative queue (0x%p, from CreateSwapChainForHwnd) DIFFERS from previously heuristic-captured queue (0x%p) — overriding with the authoritative one.", queue, g_capturedQueue);
             }
             else if (!g_capturedQueue) {
-                Logging::LogFmt("[PresentHookKit] DX12 presentation queue captured from CreateSwapChainForHwnd (authoritative, not a guess): 0x%p", queue);
+                Logging::LogFmt("[PresentHookKit] DX12 command queue captured authoritatively via CreateSwapChainForHwnd: 0x%p", queue);
             }
             g_capturedQueue = queue;
             g_hasCapturedQueue = true;
-            queue->Release(); // raw pointer only, same lifetime assumption already used for the heuristic capture below — the app's own long-lived queue, not ours to own
+            g_queueCaptureIsAuthoritative = true;
+            queue->Release(); // QueryInterface AddRef'd it; g_capturedQueue is a borrowed, non-owning pointer same as everywhere else in this file
         }
 
         inline HRESULT STDMETHODCALLTYPE HookedExecuteCommandLists(
             ID3D12CommandQueue* queue, UINT numLists, ID3D12CommandList* const* lists)
         {
-            // PERMANENT FIX, confirmed via repeated testing (see
-            // OVERLAY-REDESIGN-RESULT.md): capturing the wrong queue was
-            // the actual cause of the Present()-returns-
-            // DXGI_ERROR_INVALID_CALL crash. This hook is a shared-function
-            // patch (MinHook patches the function's own code, not a
-            // per-instance vtable slot) — it fires for EVERY
+            // Shared-function patch (MinHook patches the function's own
+            // code, not a per-instance vtable slot) — fires for EVERY
             // ID3D12CommandQueue::ExecuteCommandLists call in the process,
             // on ANY queue, not just the swapchain's real presentation
             // queue. RE3-DX12 confirmed to use 3 separate queues (COPY,
-            // DIRECT, COMPUTE) — COPY called first, so the old
-            // capture-whichever-calls-first logic silently latched onto
-            // COPY and submitted our DIRECT-type render commands there,
-            // which a COPY queue cannot execute — corrupting swapchain
-            // state well before Present() itself failed. A DXGI
-            // swapchain's presentation queue is always CreateCommandQueue'd
-            // as D3D12_COMMAND_LIST_TYPE_DIRECT (DXGI requires this), so
-            // reject anything else. Every distinct queue seen is logged
-            // once per session — cheap, keeps every future log
-            // self-documenting (which/how many queues this game uses,
-            // which one got captured) without needing a special diagnostic
-            // build to find out again.
+            // DIRECT, COMPUTE) — a DXGI swapchain's presentation queue is
+            // always CreateCommandQueue'd as D3D12_COMMAND_LIST_TYPE_DIRECT,
+            // so reject anything else. Every distinct queue seen is logged
+            // once per session.
             {
                 static std::vector<ID3D12CommandQueue*> seenQueues;
                 bool alreadySeen = false;
@@ -1377,17 +1567,17 @@ namespace PresentHookKit {
                 }
             }
 
-            // FALLBACK ONLY — see OnSwapChainCreationQueueSeen above,
-            // which is authoritative and always wins when it fires.
-            // Multiple DIRECT-type queues per game (confirmed: Daemon X
-            // Machina/UE5 has two, priority 0 and 100) mean DIRECT-type
-            // filtering alone isn't enough to guarantee the right queue —
-            // that's why this only fills in if the authoritative source
-            // above never fired (e.g. game creates its swapchain before
-            // this DLL's factory hook installs — should be rare given
-            // Install() runs at DLL startup, but kept as a safety net
-            // rather than leaving DX12 with zero queue at all).
-            if (!g_capturedQueue && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+            // FALLBACK ONLY — see OnSwapChainCreationQueueSeen above, which
+            // is authoritative and always wins when it fires.
+            bool isDirectQueue = queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+            if (isDirectQueue) {
+                // Feeds RecordPresentForCorrelation's real-queue resolution
+                // — safe/cheap to call unconditionally even once a queue is
+                // already captured, since correlation runs independently
+                // and can still override a wrong fallback guess.
+                RecordExecuteCommandListsForCorrelation(queue);
+            }
+            if (!g_capturedQueue && isDirectQueue) {
                 g_capturedQueue = queue;
                 g_hasCapturedQueue = true;
                 Logging::LogFmt("[PresentHookKit] DX12 command queue captured via fallback (ExecuteCommandLists first-caller heuristic): 0x%p type=DIRECT", queue);
@@ -1430,29 +1620,41 @@ namespace PresentHookKit {
         }
 
         inline void Uninstall() {
-            // Wait for the GPU to finish with anything we might still own
-            // before releasing it — per handover doc §6, skipping this is
-            // a very reliable DX12 crash-on-unload, more so than DX9/DX11's
-            // simpler (bounded-risk-but-not-eliminated) teardown.
-            if (g_fence && g_fenceEvent && g_fenceLastSignaled > 0 &&
+            // Wait for the GPU to finish with anything the native path
+            // might still own before releasing it — skipping this is a
+            // very reliable DX12 crash-on-unload. D3D11On12's Flush() has
+            // already synchronized its own per-frame work by this point.
+            if (!g_usingD3D11On12 && g_fence && g_fenceEvent && g_fenceLastSignaled > 0 &&
                 g_fence->GetCompletedValue() < g_fenceLastSignaled) {
                 g_fence->SetEventOnCompletion(g_fenceLastSignaled, g_fenceEvent);
                 WaitForSingleObject(g_fenceEvent, 2000); // bounded wait — never hang teardown indefinitely
             }
 
-            if (g_imguiInit) { ImGui_ImplDX12_Shutdown(); g_imguiInit = false; }
+            if (g_imguiInit) {
+                if (g_usingD3D11On12) ImGui_ImplDX11_Shutdown();
+                else ImGui_ImplDX12_Shutdown();
+                g_imguiInit = false;
+            }
+
             if (g_commandList) { g_commandList->Release(); g_commandList = nullptr; }
             for (auto& fc : g_frameContexts) if (fc.allocator) fc.allocator->Release();
             g_frameContexts.clear();
+
             ReleaseBackBuffers();
             if (g_rtvHeap) { g_rtvHeap->Release(); g_rtvHeap = nullptr; }
             if (g_srvHeap) { g_srvHeap->Release(); g_srvHeap = nullptr; }
             if (g_fence) { g_fence->Release(); g_fence = nullptr; }
             if (g_fenceEvent) { CloseHandle(g_fenceEvent); g_fenceEvent = nullptr; }
+
+            if (g_d3d11on12Device) { g_d3d11on12Device->Release(); g_d3d11on12Device = nullptr; }
+            if (g_d3d11Context) { g_d3d11Context->Release(); g_d3d11Context = nullptr; }
+            if (g_d3d11Device) { g_d3d11Device->Release(); g_d3d11Device = nullptr; }
+
             if (g_device) { g_device->Release(); g_device = nullptr; }
             g_installed = false;
         }
     } // namespace DX12
+
 
     // Ported directly from current SteamSwitcher's ModInjector.cs
     // (WaitForGameWindowAsync/HasVisibleUntitledWindow/HasVisibleTitleWindow)
@@ -1572,36 +1774,30 @@ namespace PresentHookKit {
         bool isDX11 = GetModuleHandleA("d3d11.dll") != nullptr;
 
         // ═══════════════════════════════════════════════════════════════
-        // TESTING CONFIGURATION — NOT THE SHIPPING BUILD.
+        // DX12 has two render paths, selected per-attach in DX12::LazyInit
+        // based on whether Streamline is loaded (see DX12 namespace's own
+        // header comment): native ImGui_ImplDX12 by default (RE3-proven,
+        // unchanged — submits its own command list via
+        // DX12::g_origExecuteCommandLists), or D3D11On12 only when
+        // Streamline is present (submission happens inside Microsoft's own
+        // D3D11on12 runtime instead, removing the direct-call collision
+        // that caused the Daemon X Machina crash).
         //
-        // DX12::Install() is re-enabled below to resume the DX12
-        // investigation (see OVERLAY-REDESIGN-RESULT.md, "FINAL SHIPPING
-        // DECISION" and "DX12 re-enable attempt, reverted"). Production
-        // still ships DX11-only until DX12 passes real, repeated tests —
-        // this flag flips back to DX11-only before any real release.
+        // DX12::Install()'s ExecuteCommandLists hook installs unconditionally
+        // either way — it's always needed for queue capture, and the native
+        // path additionally reuses it as the real submission trampoline.
         //
-        //   DX9  — still disabled. Untested, unrelated to this DX12 push.
+        // DX9 remains disabled — untested, unrelated to this DX12 work.
         //
-        //   DX12 — re-enabled for testing, paired with
-        //          g_diagnosticSkipRenderSubmission=true (see that flag's
-        //          own comment) to run next-steps item #1: confirm whether
-        //          DX12 attach-only (heap/allocator/fence creation, no
-        //          command-list submission) survives against RE3-DX12 with
-        //          Steam overlay present and no Streamline. If this
-        //          survives repeated testing, flip
-        //          g_diagnosticSkipRenderSubmission back to false next to
-        //          test real submission. If attach-only itself crashes,
-        //          the bug is in LazyInit's setup calls, not RenderFrame.
-        //
-        // DX11 remains installed unconditionally — it's still the only
+        // DX11 remains installed unconditionally — still the only
         // confirmed-stable backend and DX12 games rely on DX11's Present
         // hook as their shared frame-boundary signal (see this file's own
         // header comment).
         // ═══════════════════════════════════════════════════════════════
         if (isDX11) DX11::Install();
         if (isDX12) DX12::Install();
-        Logging::LogFmt("[PresentHookKit] Module detection: d3d12=%d d3d11=%d — TESTING config: DX11 always installed, DX12 re-enabled (diagnosticSkipRenderSubmission=%d), DX9 still disabled.",
-            (int)isDX12, (int)isDX11, (int)DX12::g_diagnosticSkipRenderSubmission);
+        Logging::LogFmt("[PresentHookKit] Module detection: d3d12=%d d3d11=%d — DX11 always installed; DX12 re-enabled (native ImGui_ImplDX12 path, or D3D11On12 if Streamline is present — decided per-attach); DX9 still disabled.",
+            (int)isDX12, (int)isDX11);
     }
 
     inline void InstallAll() {

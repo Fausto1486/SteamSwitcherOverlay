@@ -202,10 +202,18 @@ namespace Overlay {
 
         for (const auto& row : rows) {
             PrevModState& p = prev[row.modName];
-            if (!p.seen) {
-                p = { row.hooked, row.outdated, row.busy, row.activeLabels, true };
-                continue;
-            }
+            // Baseline is "nothing active yet" (PrevModState's own default
+            // construction — hooked/outdated/busy=false, activeLabels
+            // empty), NOT the row's actual current state. Falling through
+            // to the normal diff logic below means a mod that already
+            // finished hooking before this DLL's first render frame (fast
+            // auto-hookers like CharacterStats's ModKit_OnInjectionComplete
+            // callback, combined with Daemon X Machina's ~1.5s Present-
+            // correlation attach delay) still gets its "just hooked" toast
+            // instead of silently swallowing it as an assumed baseline. A
+            // genuinely not-yet-hooked mod still produces no toast either
+            // way, since false→false is not a transition.
+            if (!p.seen) p.seen = true;
 
             if (row.busy && !p.busy)
                 g_toasts.Push(row.modName, row.modName, ToastKind::Scanning);

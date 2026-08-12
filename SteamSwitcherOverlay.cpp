@@ -7,18 +7,20 @@
 // SteamSwitcher already opened a handle to — there is no "wrong process"
 // risk to guard against at all.
 //
-// TESTING ONLY, separately: this DLL can also be loaded via the standalone
-// CbtInjector.exe test harness (SetWindowsHookEx/WH_CBT), used throughout
-// this project's development to validate hooking/rendering in isolation
-// without needing a full SteamSwitcher session. That path has a REAL
-// wrong-process risk (thread-ID reuse can fire a CBT hook in an unrelated
-// process) that production injection does not share — CbtProc export at
-// the bottom of this file exists solely to keep that test path usable.
+// TESTING HISTORY: this DLL could previously also be loaded via a
+// standalone CbtInjector.exe test harness (SetWindowsHookEx/WH_CBT), used
+// throughout this project's early development to validate hooking/
+// rendering in isolation without needing a full SteamSwitcher session.
+// That path had a REAL wrong-process risk (thread-ID reuse can fire a CBT
+// hook in an unrelated process) that production injection does not share.
+// Testing now happens directly through a real SteamSwitcher session
+// instead — the CBT-specific export that path needed has been removed
+// (see git history if it's ever needed again).
 //
 // PIN THIS MODULE FIRST — before anything else, including
 // DisableThreadLibraryCalls. Originally added for a CBT-specific reason
-// (the test injector releases its hook once its own timing measurement
-// finishes, which could unload this module out from under a still-running
+// (the test injector released its hook once its own timing measurement
+// finished, which could unload this module out from under a still-running
 // background thread — a real bug found and fixed during testing, see
 // OVERLAY-REDESIGN-RESULT.md's "The false negative" section). Kept as
 // general defensive practice under production injection too — SteamSwitcher
@@ -96,15 +98,4 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         PresentHookKit::UninstallAll();
     }
     return TRUE;
-}
-
-// TESTING-HARNESS EXPORT ONLY — required by CbtInjector.exe's
-// SetWindowsHookEx(WH_CBT, ...) call, which resolves this export by name
-// before installing its hook. NEVER called in production (SteamSwitcher's
-// own InjectDll never touches this). Kept so the standalone test harness
-// remains usable for future isolated hooking/rendering validation without
-// needing a rebuild — has zero effect otherwise, this function is never
-// invoked by anything in the real production path.
-extern "C" __declspec(dllexport) LRESULT CALLBACK CBTProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
