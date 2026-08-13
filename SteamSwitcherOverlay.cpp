@@ -80,7 +80,7 @@ namespace {
 
 } // namespace
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         HMODULE pinned = nullptr;
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -94,8 +94,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         if (h) CloseHandle(h);
     }
     else if (reason == DLL_PROCESS_DETACH) {
+        // lpReserved is a documented Microsoft signal: non-NULL means the
+        // PROCESS is terminating (game closing normally/crashing), NULL
+        // means this is a live FreeLibrary-driven unload (e.g. an explicit
+        // uninject while the game keeps running). These need different
+        // cleanup: see PresentHookKit::UninstallAll's own comment on why
+        // process-terminating DETACH must not touch the game's D3D device
+        // at all — confirmed via two separate real hangs, both of which
+        // stopped the whole game process from exiting until force-killed.
         OverlayPipe::Stop();
-        PresentHookKit::UninstallAll();
+        PresentHookKit::UninstallAll(lpReserved != nullptr);
     }
     return TRUE;
 }

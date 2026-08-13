@@ -424,7 +424,15 @@ namespace PresentHookKit {
             return ok;
         }
 
-        inline void Uninstall() {
+        inline void Uninstall(bool skipDeviceCleanup = false) {
+            // See DX12::Uninstall's identical parameter for the full
+            // reasoning — process-terminating DETACH must not touch the
+            // game's own device/D3D state. DX9 hasn't shown a hang like
+            // DX12 has (real usage against a DX9 game was never confirmed
+            // at all — see this file's own DX9 status notes), but this is
+            // the same class of risk, so it gets the same treatment
+            // pre-emptively rather than waiting to find out the hard way.
+            if (skipDeviceCleanup) { g_imguiInit = false; g_installed = false; return; }
             if (g_imguiInit) { ImGui_ImplDX9_Shutdown(); g_imguiInit = false; }
             g_installed = false;
         }
@@ -548,7 +556,20 @@ namespace PresentHookKit {
 
         inline HWND g_attachedWindow = nullptr; // which window we're CURRENTLY rendering against — may change mid-session
 
-        inline void TearDown() {
+        inline void TearDown(bool skipDeviceCleanup = false) {
+            if (skipDeviceCleanup) {
+                // See DX12::Uninstall's identical parameter for the full
+                // reasoning — process-terminating DETACH must not touch
+                // the game's own device/context via Release(). Just drop
+                // the pointers; the OS reclaims them regardless.
+                g_mainRTV = nullptr;
+                g_context = nullptr;
+                g_device = nullptr;
+                g_win32BackendActive = false;
+                g_imguiInit = false;
+                g_attachedWindow = nullptr;
+                return;
+            }
             if (g_mainRTV) { g_mainRTV->Release(); g_mainRTV = nullptr; }
             if (g_imguiInit) {
                 ImGui_ImplDX11_Shutdown();
@@ -947,8 +968,8 @@ namespace PresentHookKit {
             return g_installed;
         }
 
-        inline void Uninstall() {
-            TearDown();
+        inline void Uninstall(bool skipDeviceCleanup = false) {
+            TearDown(skipDeviceCleanup);
             // MH_Uninitialize() (called from the shared UninstallAll())
             // handles unhooking now — back to MinHook-managed.
             g_installed = false;
@@ -1182,7 +1203,7 @@ namespace PresentHookKit {
         // Called only from DX11::HookedPresent's fallback path — see this
         // file's own header comment. `swapChain` here is the REAL game
         // swapchain, not a dummy; Install() below never touches it.
-        inline void Uninstall(); // forward decl — LazyInit reuses this for cleanup on a ClaimHwndAndSubclass abort
+        inline void Uninstall(bool skipDeviceCleanup = false); // forward decl — LazyInit reuses this for cleanup on a ClaimHwndAndSubclass abort
 
         inline void LazyInit(IDXGISwapChain* swapChain) {
             if (g_imguiInit || g_attachPermanentlyAborted) return;
@@ -1224,7 +1245,15 @@ namespace PresentHookKit {
                         Logging::LogFmt("[PresentHookKit] DX12 LazyInit: Streamline present, queue not yet resolved via Present-correlation — waiting rather than guessing.");
                         loggedWaitOnce = true;
                     }
-                    Uninstall(); // releases g_device (just assigned above) and resets state; not a permanent abort — retry next frame
+                    // NOT the full Uninstall() — nothing but g_device has
+                    // been created yet at this point (this is right after
+                    // swapChain->GetDevice() above, before any heap/D3D11On12/
+                    // ImGui setup), and this branch runs every frame for the
+                    // whole ~90-frame correlation window. Calling the full
+                    // teardown (with its own logging) here was pure log
+                    // spam — confirmed in testing, ~90 "teardown complete"
+                    // lines per session with nothing actually torn down.
+                    if (g_device) { g_device->Release(); g_device = nullptr; }
                     return;
                 }
                 if (!g_queueResolvedSuccessfully) {
@@ -1619,16 +1648,66 @@ namespace PresentHookKit {
             return g_installed;
         }
 
-        inline void Uninstall() {
+        inline void Uninstall(bool skipDeviceCleanup) {
+            // skipDeviceCleanup=true means the PROCESS is terminating (see
+            // UninstallAll's own comment) — confirmed via two separate real
+            // hangs (a query/flush/poll sync attempt, then even a plain
+            // Release() call) that ANY interaction with the game's D3D
+            // device in that situation can block process exit indefinitely.
+            // Skip everything device/GPU-related entirely and just drop the
+            // pointers — the OS reclaims all of it regardless once the
+            // process actually dies. This is NOT used for the mid-session
+            // abort calls elsewhere in this namespace (ClaimHwndAndSubclass
+            // refusal, correlation-inconclusive refusal) — those still run
+            // with the process very much alive and get full cleanup.
+            if (skipDeviceCleanup) {
+                g_imguiInit = false;
+                g_commandList = nullptr;
+                g_frameContexts.clear();
+                g_backBuffers.clear();
+                g_wrappedBackBuffers.clear();
+                g_rtvsD3D11On12.clear();
+                g_rtvHeap = nullptr;
+                g_srvHeap = nullptr;
+                g_fence = nullptr;
+                g_fenceEvent = nullptr;
+                g_d3d11on12Device = nullptr;
+                g_d3d11Context = nullptr;
+                g_d3d11Device = nullptr;
+                g_device = nullptr;
+                g_installed = false;
+                return;
+            }
+
             // Wait for the GPU to finish with anything the native path
             // might still own before releasing it — skipping this is a
-            // very reliable DX12 crash-on-unload. D3D11On12's Flush() has
-            // already synchronized its own per-frame work by this point.
+            // very reliable DX12 crash-on-unload.
             if (!g_usingD3D11On12 && g_fence && g_fenceEvent && g_fenceLastSignaled > 0 &&
                 g_fence->GetCompletedValue() < g_fenceLastSignaled) {
+                Logging::LogFmt("[PresentHookKit] DX12::Uninstall: waiting on native-path fence before teardown.");
                 g_fence->SetEventOnCompletion(g_fenceLastSignaled, g_fenceEvent);
                 WaitForSingleObject(g_fenceEvent, 2000); // bounded wait — never hang teardown indefinitely
             }
+
+            // Deliberately NO explicit GPU-sync (query/flush/etc.) for the
+            // D3D11On12 path — tried that (CreateQuery + End + Flush +
+            // polled GetData) and it hung the entire process exit
+            // indefinitely, confirmed via logging: the log stopped dead
+            // right before this comment with no timeout message ever
+            // printed, meaning the hang was inside CreateQuery/End/Flush
+            // themselves — plain D3D calls with no timeout of their own —
+            // not inside the polling loop's own bounded check. Those calls
+            // can block indefinitely against a device that's already
+            // unstable by DLL_PROCESS_DETACH time (the game's own D3D12
+            // device is very plausibly tearing down concurrently). Plain
+            // Release() below is the safer choice: COM drivers are held to
+            // a much higher bar for handling final-refcount Release()
+            // cleanly even in a degraded state than for handling a NEW
+            // command (CreateQuery/Flush) issued against one. This whole
+            // Release()-based path is now ONLY reached for mid-session
+            // aborts (process alive, device stable) — skipDeviceCleanup
+            // above handles the process-terminating case where even THIS
+            // was confirmed to hang once.
 
             if (g_imguiInit) {
                 if (g_usingD3D11On12) ImGui_ImplDX11_Shutdown();
@@ -1652,6 +1731,7 @@ namespace PresentHookKit {
 
             if (g_device) { g_device->Release(); g_device = nullptr; }
             g_installed = false;
+            Logging::LogFmt("[PresentHookKit] DX12::Uninstall: teardown complete.");
         }
     } // namespace DX12
 
@@ -1804,15 +1884,51 @@ namespace PresentHookKit {
         InstallWorkerThreadProc();
     }
 
-    inline void UninstallAll() {
+    inline void UninstallAll(bool processTerminating = false) {
+        Logging::LogFmt("[PresentHookKit] UninstallAll: starting (processTerminating=%d).", (int)processTerminating);
+
         // MH_Uninitialize() handles all hooks now — Present/ResizeBuffers
         // are back to MinHook-managed (see this file's own header comment
         // on why vtable-swap was reverted), same as ExecuteCommandLists.
+        // Left unconditional — this only patches/restores instruction
+        // bytes via VirtualProtect, no device/GPU/thread interaction, so
+        // it doesn't carry the same process-terminating risk as the D3D
+        // cleanup below.
         MH_Uninitialize();
+        Logging::LogFmt("[PresentHookKit] UninstallAll: MH_Uninitialize done.");
 
-        DX9::Uninstall();
-        DX11::Uninstall();
-        DX12::Uninstall(); // waits on its own fence internally — see its own comment
+        // processTerminating=true (see DllMain's own comment on lpReserved)
+        // skips all D3D/COM cleanup below — confirmed via two separate
+        // real hangs (a query/flush/poll sync, then even a PLAIN Release()
+        // call) that touching the game's own device while the process is
+        // actually terminating can block process exit indefinitely. Both
+        // hangs happened in exactly this situation: other threads in the
+        // process may already be forcibly gone by this point, and the
+        // game's own D3D device may already be mid-teardown concurrently
+        // with us — Microsoft's own DllMain guidance is explicit that
+        // DLL_PROCESS_DETACH-on-terminate should avoid this kind of call
+        // entirely. The OS reclaims every GPU/COM/memory resource
+        // regardless once the process actually dies, so skipping this is
+        // not a leak in any meaningful sense — it's deferring cleanup to
+        // the party (the OS) that was always going to do it anyway.
+        DX9::Uninstall(processTerminating);
+        Logging::LogFmt("[PresentHookKit] UninstallAll: DX9::Uninstall done.");
+        DX11::Uninstall(processTerminating);
+        Logging::LogFmt("[PresentHookKit] UninstallAll: DX11::Uninstall done.");
+        DX12::Uninstall(processTerminating);
+        Logging::LogFmt("[PresentHookKit] UninstallAll: DX12::Uninstall done.");
+
+        if (processTerminating) {
+            // Also skip everything below: HotkeyPoll::Stop() likely joins
+            // a background thread (joining a thread that may already be
+            // forcibly terminated by the OS is the textbook second way to
+            // hang DLL_PROCESS_DETACH-on-terminate), and
+            // SetWindowLongPtrA/ImGui_ImplWin32_Shutdown touch a game
+            // window that's already tearing down concurrently. None of
+            // this matters once the process is about to disappear anyway.
+            Logging::LogFmt("[PresentHookKit] UninstallAll: complete (process-terminating fast path — skipped thread/window cleanup).");
+            return;
+        }
 
         Sleep(50); // residual-in-flight-call safety margin, same as the archive's version
 
@@ -1830,6 +1946,7 @@ namespace PresentHookKit {
         HotkeyPoll::Stop();
         g_gameHwnd = nullptr;
         g_originalWndProc = nullptr;
+        Logging::LogFmt("[PresentHookKit] UninstallAll: complete.");
     }
 
 } // namespace PresentHookKit
