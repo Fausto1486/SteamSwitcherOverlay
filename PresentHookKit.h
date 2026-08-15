@@ -1932,6 +1932,12 @@ namespace PresentHookKit {
 
         Sleep(50); // residual-in-flight-call safety margin, same as the archive's version
 
+        // Safety net: if the panel was still open (live uninject, not the
+        // game closing), ForceCursorUsable's overrides must not outlive
+        // this DLL - same non-terminating-only reasoning as everything
+        // else below.
+        Overlay::RestoreCursor();
+
         if (g_gameHwnd && IsWindow(g_gameHwnd) && g_originalWndProc) {
             SetWindowLongPtrA(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalWndProc));
         }

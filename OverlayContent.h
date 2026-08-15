@@ -299,6 +299,85 @@ namespace Overlay {
 
     inline bool g_statusPanelOpen = false;
 
+    // ── Cursor / input arbitration ────────────────────────────────────────
+    // Toast mode's ModsStatusPanel is a real top-level OS window - it gets
+    // usable mouse input for free regardless of what the game does with the
+    // cursor. This panel is drawn inside the game's own window instead, so
+    // two separate things the game does every frame have to be actively
+    // fought while the panel is open:
+    //
+    //  1. ClipCursor()/ShowCursor() - confines/hides the pointer for camera
+    //     look. Re-asserted every frame, so releasing it once at open-time
+    //     isn't enough (see ForceCursorUsable, called every DrawStatusPanel
+    //     frame).
+    //  2. Raw mouse input (RegisterRawInputDevices with RIDEV_NOLEGACY) -
+    //     many games register this for camera look, which makes Windows
+    //     stop delivering legacy WM_MOUSEMOVE/WM_LBUTTONDOWN/etc to every
+    //     window in the process entirely (only WM_INPUT arrives instead).
+    //     OverlayWndProc/ImGui only ever look at the legacy messages, so
+    //     while raw input is registered, clicks on the panel never reach
+    //     it at all even though it renders and the cursor is visible and
+    //     unclipped - this is the one that actually blocks "stats"/"config"
+    //     row clicks. Fixed by unregistering the game's own mouse raw-input
+    //     device while the panel is open (restores legacy delivery) and
+    //     re-registering it exactly as it was on close.
+    inline bool g_cursorForced = false;
+    inline RECT g_savedClip{};
+    inline bool g_rawMouseSuppressed = false;
+    inline std::vector<RAWINPUTDEVICE> g_savedRawDevices;
+
+    inline void SuppressRawMouseCapture() {
+        if (g_rawMouseSuppressed) return;
+        g_rawMouseSuppressed = true; // set first - always balanced by RestoreRawMouseCapture below, even if nothing was found
+
+        UINT count = 0;
+        GetRegisteredRawInputDevices(nullptr, &count, sizeof(RAWINPUTDEVICE));
+        if (count == 0) return;
+
+        std::vector<RAWINPUTDEVICE> devices(count);
+        UINT got = GetRegisteredRawInputDevices(devices.data(), &count, sizeof(RAWINPUTDEVICE));
+        if (got == (UINT)-1) return;
+        devices.resize(got);
+
+        for (auto& dev : devices) {
+            // Generic mouse only (usage page 1, usage 2) - leave keyboard
+            // and any other raw-input device (e.g. a controller) alone, the
+            // panel only needs mouse messages back.
+            if (dev.usUsagePage != 1 || dev.usUsage != 2) continue;
+            g_savedRawDevices.push_back(dev);
+            RAWINPUTDEVICE remove = dev;
+            remove.dwFlags = RIDEV_REMOVE;
+            remove.hwndTarget = nullptr;
+            RegisterRawInputDevices(&remove, 1, sizeof(RAWINPUTDEVICE));
+        }
+    }
+
+    inline void RestoreRawMouseCapture() {
+        if (!g_rawMouseSuppressed) return;
+        for (auto& dev : g_savedRawDevices)
+            RegisterRawInputDevices(&dev, 1, sizeof(RAWINPUTDEVICE));
+        g_savedRawDevices.clear();
+        g_rawMouseSuppressed = false;
+    }
+
+    inline void ForceCursorUsable() {
+        if (!g_cursorForced) {
+            GetClipCursor(&g_savedClip); // remember pre-panel confinement, even "none" (full virtual screen)
+            g_cursorForced = true;
+        }
+        ClipCursor(nullptr);
+        while (ShowCursor(TRUE) < 0);
+        SuppressRawMouseCapture();
+    }
+
+    inline void RestoreCursor() {
+        RestoreRawMouseCapture();
+        if (!g_cursorForced) return;
+        ClipCursor(&g_savedClip);
+        while (ShowCursor(FALSE) >= 0);
+        g_cursorForced = false;
+    }
+
     inline SRWLOCK g_trackedLock = SRWLOCK_INIT;
     inline std::vector<HWND> g_trackedConfigHwnds;
 
@@ -337,6 +416,7 @@ namespace Overlay {
         if (!g_statusPanelOpen) return;
         g_statusPanelOpen = false;
         CloseTrackedConfigWindows();
+        RestoreCursor();
     }
 
     inline void ToggleStatusPanel() {
@@ -368,6 +448,8 @@ namespace Overlay {
     }
 
     inline void DrawStatusPanel(const std::vector<ModRow>& rows) {
+        ForceCursorUsable(); // re-assert every frame - see this state's own comment above
+
         const float WIDTH = 280, ROW_H = 26, PAD = 10, HEADER_H = 30;
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
