@@ -15,14 +15,15 @@ It is not a standalone tool. It's designed to be injected by SteamSwitcher itsel
 5. [Hooking Strategy](#hooking-strategy)
 6. [DX12 Queue Capture](#dx12-queue-capture)
 7. [Data Flow: ModKit → Overlay](#data-flow-modkit--overlay)
-8. [Attach Lifecycle](#attach-lifecycle)
-9. [Pipe Protocol](#pipe-protocol)
-10. [Hotkey](#hotkey)
-11. [Logging](#logging)
-12. [Known Limitations](#known-limitations)
-13. [Deployment Layout](#deployment-layout)
-14. [Build Notes](#build-notes)
-15. [Safety Scope](#safety-scope)
+8. [In-Game Config Windows](#in-game-config-windows)
+9. [Attach Lifecycle](#attach-lifecycle)
+10. [Pipe Protocol](#pipe-protocol)
+11. [Hotkey](#hotkey)
+12. [Logging](#logging)
+13. [Known Limitations](#known-limitations)
+14. [Deployment Layout](#deployment-layout)
+15. [Build Notes](#build-notes)
+16. [Safety Scope](#safety-scope)
 
 ---
 
@@ -60,9 +61,9 @@ SteamSwitcher injects this DLL the exact same way it injects `ModKit.dll` — `C
 |---|---|
 | `SteamSwitcherOverlay.cpp` | Entry point. `DllMain`, module pinning, wires the hotkey/pipe callbacks to `PresentHookKit::RequestAttach()` and `Overlay::*`. |
 | `PresentHookKit.h` | All D3D9/D3D11/D3D12 hooking. Installs/uninstalls hooks, drives the attach/render lifecycle, owns the DX12 queue-capture logic. The largest file in the project — see [Hooking Strategy](#hooking-strategy). |
-| `OverlayContent.h` | `DrawOverlay()` — the actual pixels. Builds the per-frame `ModRow` list from `SharedDataReader`, diffs it against the previous frame to push toast notifications, and draws the status panel + toast stack via ImGui. |
+| `OverlayContent.h` | `DrawOverlay()` — the actual pixels. Builds the per-frame `ModRow` list from `SharedDataReader`, diffs it against the previous frame to push toast notifications, and draws the status panel, toast stack, and (see [In-Game Config Windows](#in-game-config-windows)) a mod's config-window panel via ImGui. |
 | `SharedDataReader.h` | Read-only access to ModKit's `ModKitSharedData_v1` named shared-memory block. Ported from SteamSwitcher's own `ModSharedStatusReadercs.cs` — same layout, same read philosophy (open fresh every read, no locking, torn reads self-correct on next resync). No `ModKit.dll` build dependency. |
-| `ModKitInterop.h` | Lazy `GetProcAddress`-based access to a handful of `ModKit.dll` exports (`ModKit_HasButton`/`ClickButton`/`IsPoolSearching`/`IsPoolClearing`) — resolved at runtime, re-attempted every call until found, since load order between the two DLLs isn't guaranteed. No static link to `ModKit.lib` at all. |
+| `ModKitInterop.h` | Lazy `GetProcAddress`-based access to `ModKit.dll` exports — the original four (`ModKit_HasButton`/`ClickButton`/`IsPoolSearching`/`IsPoolClearing`) plus the full config-window overlay bridge (`ModKit_ClickButtonForOverlay`, `ModKit_HasConfigWindow`, `ModKit_GetConfigWindowTitle`/`RowCount`/`Row`/`DropdownOption`, `ModKit_SetConfigWindowToggle`/`Float`/`Int`/`Dropdown`, `ModKit_CloseConfigWindowFromOverlay`/`CloseAllConfigWindows` — see [In-Game Config Windows](#in-game-config-windows)) — resolved at runtime, re-attempted every call until found, since load order between the two DLLs isn't guaranteed. `ModKitConfigRowView`/`ModKitConfigRowType` are deliberately redefined here (byte-for-byte copy of `ModKit.h`'s versions) rather than included, per this file's no-header-include/no-static-link philosophy. No static link to `ModKit.lib` at all. |
 | `OverlayPipe.h` | Named-pipe server (`SteamSwitcherOverlayPipe`) — SteamSwitcher connects as client and pushes `SETMODCHANNEL|`/`TOAST|` commands. See [Pipe Protocol](#pipe-protocol). |
 | `HotkeyPoll.h` | Independent `GetAsyncKeyState(VK_INSERT)` poll (50ms) to toggle the status panel. No dependency on `ModKit.dll` being loaded at all. |
 | `Logging.h` / `RemoteLog.h` | `Logging::LogFmt` forwards every line to SteamSwitcher's optional debug-log pipe (`SteamSwitcherOverlayLogPipe`) via a best-effort, no-retry `CreateFileA`/`WriteFile` per call. No local log file. |
@@ -128,6 +129,24 @@ ModKit.dll (per-mod)          ModKitSharedData_v1          SteamSwitcherOverlay.
 
 ---
 
+## In-Game Config Windows
+
+Clicking a clickable row in the status panel doesn't just invoke the mod's button callback — it can also render that mod's `ModConfigWindow` (see the `ModKit` project's own README, [Config Window Overlay Bridge](../ModKit/README.md#config-window-overlay-bridge)) directly inside this overlay via ImGui, instead of a native win32 popup.
+
+**Row click → two parallel paths, one wins per mod:**
+
+1. `DrawStatusPanel`'s row click calls `ModKitInterop::ClickButtonForOverlay(modName)` — **not** plain `ClickButton` — so `ModKit.dll` marks the resulting `ModConfigWindow::Open()` call as an in-game overlay click specifically (see `ModKit_IsOverlayActive`'s design in the ModKit README). It also sets `g_openConfigModName = modName` and calls `TrackConfigWindowFor(modName)`.
+2. **Rebuilt mod (registers with the bridge):** `Open()` sees `ModKit_IsOverlayActive() == true` and registers a `ModKitConfigWindowProvider` instead of creating a native window. `DrawConfigPanel()` then finds `ModKitInterop::HasConfigWindow(modName) == true` on the next frame and renders the mod's rows itself — this is the operative path, and `TrackConfigWindowFor`'s poll thread finds nothing (harmless).
+3. **Legacy/unrebuilt mod (native window only):** `HasConfigWindow` stays `false`, so `DrawConfigPanel` no-ops. `TrackConfigWindowFor`'s background thread (`PollForConfigWindowThreadProc`, polling every 100ms for up to 2s) picks up the native window by its class name (`"CD" + modName + "CfgWnd"`) and tracks its `HWND` so `CloseTrackedConfigWindows()` can `WM_CLOSE` it when the status panel closes.
+
+**`DrawConfigPanel()`** renders one mod's window at a time (matches `ModConfigWindow`'s own singleton-per-mod behavior), positioned immediately to the right of the status panel. It reads `ModKit_GetConfigWindowTitle`/`RowCount`/`Row` fresh every frame and switches on `ModKitConfigRowType` per row (Toggle → `ImGui::Checkbox`, Float/Int → `ImGui::InputFloat`/`InputInt` with `EnterReturnsTrue`, Dropdown → `ImGui::BeginCombo` + `ModKit_GetConfigWindowDropdownOption` per entry, Status → plain read-only text) — writes go back through `ModKit_SetConfigWindowToggle`/`Float`/`Int`/`Dropdown`. An Escape keypress or the header's "x" button calls `ModKit_CloseConfigWindowFromOverlay` and clears `g_openConfigModName`. The panel also stops drawing on its own the moment `HasConfigWindow` goes false — e.g. SteamSwitcher closing every config window on a `NotificationMode` switch, which sends `CLOSECONFIGWINDOWS` over the pipe (see [Pipe Protocol](#pipe-protocol)) and calls `ModKitInterop::CloseAllConfigWindows()` in response.
+
+`g_openConfigModName` is deliberately **not** cleared when the status panel itself closes (INSERT) — drawing is gated on `g_statusPanelOpen` at the call site, so the config window hides and reappears in the same spot rather than resetting, mirroring the underlying `ModConfigWindow` registration surviving the panel toggle. It only clears on an explicit close or a mode switch.
+
+**Anchor window (native fallback only).** `ModConfigWindow.h` finds where to place a *native* config window via `FindWindowA(nullptr, "ModStatusPanel")` — a real HWND in toast mode, but there's no HWND backing this ImGui-drawn panel. `EnsureAnchorWindow`/`UpdateAnchorWindow` keep an invisible, input-transparent (`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`) HWND titled `"ModStatusPanel"` in sync with the status panel's on-screen rect every frame it's open, purely as a `FindWindowA`/`GetWindowRect` target for legacy mods; `ClearAnchorWindow` blanks the title (not destroy) when the panel closes so a stray config window opened afterward falls back to SteamSwitcher's own anchor instead of matching a stale rect. Only the render thread may touch `g_anchorHwnd` — `UpdateAnchorWindow`/`ClearAnchorWindow` calls from `HotkeyPoll`'s thread would deadlock inside `SetWindowTextA` against a message queue nothing pumps. Rebuilt mods rendered via `DrawConfigPanel` don't need this — they're positioned directly off the status panel's own ImGui rect in the same frame.
+
+---
+
 ## Attach Lifecycle
 
 Hooks install early and stay installed for the life of the process — proven safe. The actual attach work (device/context refs, ImGui context creation, backbuffer/RTV setup) is deliberately delayed until one of three explicit triggers fires `PresentHookKit::RequestAttach()`:
@@ -149,6 +168,7 @@ SteamSwitcher connects as client and pushes plain `KEY|value` text to `\\.\pipe\
 | `SETMODCHANNEL\|1` | Enables Channel 2 (mod content) and requests attach. |
 | `SETMODCHANNEL\|0` | Disables Channel 2 — closes the status panel if open, but toast rendering continues (drains naturally as toasts expire). |
 | `TOAST\|<text>` | Pushes a generic, non-mod-related info toast and requests attach. |
+| `CLOSECONFIGWINDOWS` | Closes every open mod config window, native or overlay-drawn alike (calls `ModKitInterop::CloseAllConfigWindows()` — see the ModKit README's [Config Window Overlay Bridge](../ModKit/README.md#config-window-overlay-bridge)). Sent the instant SteamSwitcher's `NotificationMode` dropdown changes, so a config window from the old mode never lingers into the new one — see `ModsPanel.cs`'s `Cmb_notificationMode_Changed`. |
 
 This DLL never writes back over this pipe — logging goes out over the separate `SteamSwitcherOverlayLogPipe` instead (see [Logging](#logging)).
 
@@ -175,7 +195,7 @@ Under heavy concurrent load (e.g. several D3D12 queues on different engine threa
 - **DX9 is untested.** Implemented, never confirmed against a real DX9 game.
 - **DX12 + NVIDIA Streamline Present-correlation is probabilistic, not authoritative.** The fix (see [DX12 Queue Capture](#dx12-queue-capture)) resolves the real presentation queue by timing correlation, not by direct API observation — a real signal, not a guarantee. If correlation ever comes back inconclusive on a given game, the DLL correctly refuses to attach rather than guess (`g_queueResolvedSuccessfully == false` in `DX12::LazyInit`) — that's a missing overlay, not a crash, and is the expected/safe failure mode, not a regression to chase. `PresentHookKit.h`'s `g_refuseAttachOnStreamlineForTesting` (default `false`) instantly restores the old unconditional refuse-on-Streamline behavior if this path ever needs isolating again.
 - **32-bit games are not supported.** This DLL, MinHook, and ImGui are all architecture-agnostic C/C++ in principle, but there is no 32-bit build or 32-bit-aware injection path — SteamSwitcher falls back to its toast/notification path for 32-bit games.
-- **`ModKitInterop.h`'s four resolved exports assume they might not exist.** The header comment describing this file was written when `ModKit_HasButton`/`ClickButton`/`IsPoolSearching`/`IsPoolClearing` were not yet exported from `ModKit.dll`. They are exported now (see the `ModKit` project's own README, Host Integration Helpers) — the `GetProcAddress` approach still stands (no build-time link is still the right call for two independently-versioned DLLs), but the "these don't exist yet" framing in that file's comments is stale.
+- **`ModKitInterop.h`'s resolved exports assume they might not exist.** The header comment describing this file was written when `ModKit_HasButton`/`ClickButton`/`IsPoolSearching`/`IsPoolClearing` were not yet exported from `ModKit.dll`. All of these, plus the full config-window overlay bridge, are exported now (see the `ModKit` project's own README — Host Integration Helpers, [Config Window Overlay Bridge](../ModKit/README.md#config-window-overlay-bridge)) — the `GetProcAddress` approach still stands (no build-time link is still the right call for two independently-versioned DLLs), but the "these don't exist yet" framing in that file's comments is stale. Every unresolved export still degrades to a safe default (non-clickable rows, no config panel), consistent with the rest of this file's design.
 
 ---
 
