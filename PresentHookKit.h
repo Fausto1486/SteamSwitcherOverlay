@@ -1887,6 +1887,20 @@ namespace PresentHookKit {
     inline void UninstallAll(bool processTerminating = false) {
         Logging::LogFmt("[PresentHookKit] UninstallAll: starting (processTerminating=%d).", (int)processTerminating);
 
+        // Ask the render thread to destroy the anchor window on its own
+        // (still-hooked) next Present call, and wait briefly for it -
+        // DestroyWindow only works reliably from the thread that created
+        // the window (see OverlayContent.h's own comment), which this
+        // calling thread generally isn't. MUST happen before
+        // MH_Uninitialize() below removes the Present hook entirely, or
+        // there's no "next Present call" left for the render thread to
+        // process the request on. Skipped on process-terminating for the
+        // same reason as everything else in that branch - the OS reclaims
+        // the window regardless, and nothing below this point runs either.
+        if (!processTerminating) {
+            Overlay::RequestAnchorDestroyAndWait();
+        }
+
         // MH_Uninitialize() handles all hooks now — Present/ResizeBuffers
         // are back to MinHook-managed (see this file's own header comment
         // on why vtable-swap was reverted), same as ExecuteCommandLists.

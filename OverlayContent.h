@@ -299,6 +299,121 @@ namespace Overlay {
 
     inline bool g_statusPanelOpen = false;
 
+    // ── Anchor window ────────────────────────────────────────────────────
+    // ModConfigWindow.h (the per-mod config window, shared native C++ code)
+    // finds where to place itself via FindWindowA(nullptr, "ModStatusPanel")
+    // - see that file's ThreadProc. In toast mode that title belongs to a
+    // real WinForms HWND (View/ModsStatusPanel.cs). This panel is drawn
+    // entirely inside the game's own window via ImGui - there is no HWND
+    // backing it - so that lookup always missed and fell through to
+    // ModConfigWindow.h's ModInjectorWindow fallback (SteamSwitcher's own
+    // window), which is why config panels always opened next to
+    // SteamSwitcher instead of next to this panel.
+    //
+    // Fix: keep a real, invisible HWND titled "ModStatusPanel" in sync with
+    // DrawStatusPanel's on-screen rect. It never needs to paint or receive
+    // input - it exists purely as a FindWindowA/GetWindowRect target.
+    inline HWND g_anchorHwnd = nullptr;
+
+    // Render-thread-only bookkeeping: true while the anchor's title is set
+    // to "ModStatusPanel". g_anchorHwnd is created on (and only ever safe
+    // to touch from) the render thread - it never pumps its own message
+    // queue, so a cross-thread SetWindowTextA/SetWindowPos call targeting
+    // it would block the calling thread forever waiting for a queue that's
+    // never serviced. This flag lets DrawOverlay() (always render-thread)
+    // notice a close and clear the title itself, instead of the panel's
+    // close path (CloseStatusPanel(), reachable from HotkeyPoll's own
+    // thread) touching the HWND directly - that cross-thread call was a
+    // real deadlock: it hung the hotkey-poll thread inside SetWindowTextA,
+    // so INSERT stopped being detected at all after the first close.
+    inline bool g_anchorTitleSet = false;
+
+    // Cross-thread teardown handshake for g_anchorHwnd - see
+    // RequestAnchorDestroyAndWait()'s comment below for why this exists
+    // instead of just calling DestroyWindow() from whichever thread is
+    // unloading the DLL.
+    inline volatile bool g_anchorDestroyRequested = false;
+    inline HANDLE g_anchorDestroyedEvent = nullptr;
+
+    inline LRESULT CALLBACK AnchorWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        return DefWindowProcA(hWnd, msg, wParam, lParam);
+    }
+
+    inline void EnsureAnchorWindow() {
+        if (g_anchorHwnd) return;
+        static const char* kClassName = "SSOverlayStatusAnchor";
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = AnchorWndProc;
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpszClassName = kClassName;
+        RegisterClassA(&wc); // ok if already registered from a prior attach
+
+        g_anchorHwnd = CreateWindowExA(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            kClassName, "", WS_POPUP,
+            0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+    }
+
+    // Moves/resizes the anchor to match the panel's current screen rect and
+    // (re)applies the "ModStatusPanel" title. Called every frame the panel
+    // is open, same as the rest of DrawStatusPanel.
+    inline void UpdateAnchorWindow(int x, int y, int w, int h) {
+        EnsureAnchorWindow();
+        if (!g_anchorHwnd) return;
+        SetWindowTextA(g_anchorHwnd, "ModStatusPanel");
+        SetWindowPos(g_anchorHwnd, nullptr, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+        g_anchorTitleSet = true;
+    }
+
+    // Clears the title (not destroy) when the panel closes, so a stray
+    // config window opened afterward falls back to the SteamSwitcher
+    // anchor instead of matching a stale/hidden panel rect - mirrors
+    // ModsStatusPanel.cs's own Hide() and its header comment.
+    //
+    // MUST only ever be called from the render thread (see
+    // g_anchorTitleSet's comment) - never call this directly from
+    // CloseStatusPanel(), which can run on HotkeyPoll's own thread.
+    inline void ClearAnchorWindow() {
+        if (!g_anchorHwnd) return;
+        SetWindowTextA(g_anchorHwnd, "");
+    }
+
+    // Must run before this DLL unloads (see PresentHookKit::UninstallAll) -
+    // AnchorWndProc lives in this module, so a stale HWND left registered
+    // to it would crash the next message dispatched to it after unload.
+    // Only safe to call from the render thread that created g_anchorHwnd -
+    // DestroyWindow silently fails (not deadlocks, unlike SetWindowText/
+    // SetWindowPos) when called from any other thread, which is exactly
+    // what leaked the window before: PresentHookKit::UninstallAll runs on
+    // whatever thread is driving the DLL unload, essentially never the
+    // render thread.
+    inline void DestroyAnchorWindow() {
+        if (!g_anchorHwnd) return;
+        DestroyWindow(g_anchorHwnd);
+        g_anchorHwnd = nullptr;
+    }
+
+    // Called from any thread (PresentHookKit::UninstallAll) to have the
+    // anchor window destroyed correctly. Actual DestroyWindow() call
+    // happens inside DrawOverlay() below - on the render thread - never
+    // here. This just sets a flag and waits (bounded by timeoutMs, never
+    // forever) for that to happen on the next Present call, which is why
+    // the caller MUST issue this before removing the Present hook
+    // (MH_Uninitialize) - see UninstallAll's own comment. If Present isn't
+    // being called for any reason (game minimized/paused/already gone),
+    // this simply times out and returns - the window is left to leak for
+    // the rest of the process's life, same as before this fix, just no
+    // longer the common case.
+    inline void RequestAnchorDestroyAndWait(DWORD timeoutMs = 500) {
+        if (!g_anchorHwnd) return;
+        if (!g_anchorDestroyedEvent)
+            g_anchorDestroyedEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (g_anchorDestroyedEvent) ResetEvent(g_anchorDestroyedEvent);
+        g_anchorDestroyRequested = true;
+        if (g_anchorDestroyedEvent)
+            WaitForSingleObject(g_anchorDestroyedEvent, timeoutMs);
+    }
+
     // ── Cursor / input arbitration ────────────────────────────────────────
     // Toast mode's ModsStatusPanel is a real top-level OS window - it gets
     // usable mouse input for free regardless of what the game does with the
@@ -417,6 +532,10 @@ namespace Overlay {
         g_statusPanelOpen = false;
         CloseTrackedConfigWindows();
         RestoreCursor();
+        // Anchor title is cleared from DrawOverlay() instead, on the render
+        // thread - see g_anchorTitleSet's comment. This function is reachable
+        // from HotkeyPoll's own thread (via ToggleStatusPanel), which must
+        // never touch g_anchorHwnd directly.
     }
 
     inline void ToggleStatusPanel() {
@@ -522,6 +641,10 @@ namespace Overlay {
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_INFO_TXT), "%s", info.c_str());
             }
             ImGui::Dummy(ImVec2(0, 4));
+
+            ImVec2 finalPos = ImGui::GetWindowPos();
+            ImVec2 finalSize = ImGui::GetWindowSize();
+            UpdateAnchorWindow((int)finalPos.x, (int)finalPos.y, (int)finalSize.x, (int)finalSize.y);
         }
         ImGui::End();
         ImGui::PopStyleVar();
@@ -545,7 +668,24 @@ namespace Overlay {
     // Gated by g_channel2Enabled (SteamSwitcher's SETMODCHANNEL pipe
     // message) instead of the archive's "overlay.mode" shared-data key. ────
     inline void DrawOverlay() {
+        // Teardown handshake - see RequestAnchorDestroyAndWait()'s comment.
+        // Takes priority over everything else this frame: we're mid-unload.
+        if (g_anchorDestroyRequested) {
+            DestroyAnchorWindow();
+            g_anchorDestroyRequested = false;
+            if (g_anchorDestroyedEvent) SetEvent(g_anchorDestroyedEvent);
+            return;
+        }
+
         if (!g_channel2Enabled && g_statusPanelOpen) CloseStatusPanel();
+
+        // Render-thread-only anchor cleanup - see g_anchorTitleSet's comment.
+        // Runs regardless of g_channel2Enabled so a channel-2-disable close
+        // (the line above) still gets its anchor cleared.
+        if (!g_statusPanelOpen && g_anchorTitleSet) {
+            ClearAnchorWindow();
+            g_anchorTitleSet = false;
+        }
 
         std::vector<ModRow> rows;
         if (g_channel2Enabled) rows = ReadModRows();
