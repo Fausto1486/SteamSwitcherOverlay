@@ -45,6 +45,8 @@
 #include <unordered_map>
 #include <chrono>
 #include <algorithm>
+#include <cstring>
+#include <cstdlib>
 
 namespace Overlay {
 
@@ -299,6 +301,19 @@ namespace Overlay {
 
     inline bool g_statusPanelOpen = false;
 
+    // Which mod's config window (if any) DrawConfigPanel below should
+    // render - set on a row click regardless of whether that mod actually
+    // registered with the bridge; DrawConfigPanel's own HasConfigWindow
+    // check no-ops harmlessly if it didn't (legacy/unrebuilt mod, native
+    // window instead - see TrackConfigWindowFor for that path). NOT cleared
+    // when the in-game panel closes (INSERT) - drawing is gated on
+    // g_statusPanelOpen at the call site instead (see DrawOverlay), so the
+    // config window "hides" and reappears in the same spot rather than
+    // resetting, same as the underlying ModKit.dll registration - only
+    // actually clears on an explicit close (X / Escape) or a
+    // notification-mode switch (ModKit_CloseAllConfigWindows).
+    inline std::string g_openConfigModName;
+
     // ── Anchor window ────────────────────────────────────────────────────
     // ModConfigWindow.h (the per-mod config window, shared native C++ code)
     // finds where to place itself via FindWindowA(nullptr, "ModStatusPanel")
@@ -333,6 +348,22 @@ namespace Overlay {
     // instead of just calling DestroyWindow() from whichever thread is
     // unloading the DLL.
     inline volatile bool g_anchorDestroyRequested = false;
+
+    // Lazy, retried-every-frame notify to ModKit.dll that the overlay is
+    // attached — moved here from PresentHookKit::InstallAll() rather than
+    // firing once at attach time, for two reasons: (1) InstallAll() runs on
+    // a dedicated worker thread immediately at DLL load, potentially before
+    // ModKit.dll or any mod is even injected yet — a one-shot call there
+    // that fails has nothing to retry it, unlike every other
+    // ModKitInterop:: call in this file, which already runs every frame
+    // from here and naturally retries; (2) GetModuleHandleA/GetProcAddress
+    // both briefly need the loader lock, and calling them from that worker
+    // thread while other mod DLLs are concurrently inside their own
+    // DllMain (holding that lock, as the OS guarantees for DllMain) can
+    // block this thread until injection settles - worse the earlier attach
+    // happens (e.g. overlay already enabled from a previous session,
+    // RequestAttach() firing almost immediately). Draw time is well past
+    // that window and already proven safe for this exact pattern.
     inline HANDLE g_anchorDestroyedEvent = nullptr;
 
     inline LRESULT CALLBACK AnchorWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -421,10 +452,13 @@ namespace Overlay {
     // two separate things the game does every frame have to be actively
     // fought while the panel is open:
     //
-    //  1. ClipCursor()/ShowCursor() - confines/hides the pointer for camera
-    //     look. Re-asserted every frame, so releasing it once at open-time
-    //     isn't enough (see ForceCursorUsable, called every DrawStatusPanel
-    //     frame).
+    //  1. ClipCursor() - confines the pointer for camera look, re-asserted
+    //     every frame, so releasing it once at open-time isn't enough (see
+    //     ForceCursorUsable, called every DrawStatusPanel frame). Cursor
+    //     VISIBILITY itself is no longer fought over via ShowCursor - see
+    //     ForceCursorUsable's own comment for why that caused visible
+    //     flicker and why ImGui's own drawn cursor (io.MouseDrawCursor)
+    //     replaced it.
     //  2. Raw mouse input (RegisterRawInputDevices with RIDEV_NOLEGACY) -
     //     many games register this for camera look, which makes Windows
     //     stop delivering legacy WM_MOUSEMOVE/WM_LBUTTONDOWN/etc to every
@@ -440,6 +474,15 @@ namespace Overlay {
     inline RECT g_savedClip{};
     inline bool g_rawMouseSuppressed = false;
     inline std::vector<RAWINPUTDEVICE> g_savedRawDevices;
+    // Deferred, not written to ImGui's io struct directly: ForceCursorUsable/
+    // RestoreCursor below are reachable from threads other than the render
+    // thread (RestoreCursor is documented as callable from HotkeyPoll's own
+    // thread, via CloseStatusPanel) - writing io.MouseDrawCursor from there
+    // would race ImGui::Render() running concurrently on the render thread.
+    // Plain bool write/read here is safe (no tearing, no ImGui involvement);
+    // DrawOverlay applies it to io.MouseDrawCursor itself, every frame, on
+    // the one thread that's ever allowed to touch ImGui state.
+    inline volatile bool g_wantMouseDrawCursor = false;
 
     inline void SuppressRawMouseCapture() {
         if (g_rawMouseSuppressed) return;
@@ -481,15 +524,34 @@ namespace Overlay {
             g_cursorForced = true;
         }
         ClipCursor(nullptr);
-        while (ShowCursor(TRUE) < 0);
         SuppressRawMouseCapture();
+        // Draw our OWN cursor via ImGui instead of fighting the game over
+        // the OS hardware cursor (this used to call ShowCursor(TRUE) here
+        // every frame). Many games touch cursor visibility/rendering
+        // themselves every frame too (camera-look, or a custom UI cursor
+        // sprite drawn as part of their own scene) - racing that via
+        // ShowCursor is what caused the visible flicker, and a
+        // game-drawn cursor sprite can never be "under" an ImGui window
+        // that way since it's part of the GAME's draw calls, not ours.
+        // ImGui's drawn cursor is the literal last thing in our own draw
+        // list each frame (this hook runs after the game has already
+        // finished rendering), so it's guaranteed on top regardless of
+        // what the game does with its own cursor, and doesn't depend on
+        // the OS-level ShowCursor state at all.
+        //
+        // Deferred via g_wantMouseDrawCursor rather than writing
+        // io.MouseDrawCursor here directly - see that flag's own comment:
+        // this function must stay safe to call from the render thread
+        // only anyway (DrawStatusPanel/DrawConfigPanel), but keeping both
+        // functions symmetric avoids a footgun if a future caller doesn't.
+        g_wantMouseDrawCursor = true;
     }
 
     inline void RestoreCursor() {
         RestoreRawMouseCapture();
+        g_wantMouseDrawCursor = false;
         if (!g_cursorForced) return;
         ClipCursor(&g_savedClip);
-        while (ShowCursor(FALSE) >= 0);
         g_cursorForced = false;
     }
 
@@ -622,8 +684,26 @@ namespace Overlay {
 
                     ImGui::InvisibleButton("row", ImVec2(WIDTH - PAD * 2, ROW_H));
                     if (row.clickable && ImGui::IsItemClicked()) {
-                        ModKitInterop::ClickButton(row.modName.c_str());
+                        // ClickButtonForOverlay, NOT plain ClickButton - see
+                        // ModKit_ClickButtonForOverlay's own comment in
+                        // ModKit.h: this marks the resulting Open() call (if
+                        // any) as an in-game overlay click specifically, so
+                        // it's routed correctly regardless of what else is
+                        // happening (e.g. SteamSwitcher's own desktop
+                        // "Config" button, which still uses plain
+                        // ClickButton via CmdPipeThread and always means
+                        // native, even if this in-game panel also happens
+                        // to be open at the same time).
+                        ModKitInterop::ClickButtonForOverlay(row.modName.c_str());
                         TrackConfigWindowFor(row.modName);
+                        // Phase 2: draw this mod's config window ourselves if
+                        // it registered with the bridge (see DrawConfigPanel
+                        // below) - a legacy/unrebuilt mod that opened a
+                        // native window instead just leaves HasConfigWindow
+                        // false, so DrawConfigPanel's own check no-ops and
+                        // TrackConfigWindowFor above stays the operative
+                        // path for it, unchanged.
+                        g_openConfigModName = row.modName;
                     }
                     ImGui::PopID();
                 }
@@ -645,6 +725,152 @@ namespace Overlay {
             ImVec2 finalPos = ImGui::GetWindowPos();
             ImVec2 finalSize = ImGui::GetWindowSize();
             UpdateAnchorWindow((int)finalPos.x, (int)finalPos.y, (int)finalSize.x, (int)finalSize.y);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+    }
+
+    // ── Config window panel (phase 2) ────────────────────────────────────────
+    // Renders whichever mod's config window most recently registered with
+    // the bridge (see ModKit.h's CONFIG WINDOW OVERLAY BRIDGE), one at a
+    // time - matches ModConfigWindow's own singleton-per-mod behavior, so
+    // there's never more than one to show anyway. Positioned to the right
+    // of the status panel, the same spot the native version's own
+    // FindWindowA anchor logic already places it - drawn in the SAME ImGui
+    // frame here instead, so no anchor-window trick is needed for this
+    // panel specifically (only the status panel above still needs one, for
+    // legacy/unrebuilt mods' native config windows to anchor against).
+    inline void DrawConfigPanel() {
+        if (g_openConfigModName.empty()) return;
+        if (!ModKitInterop::HasConfigWindow(g_openConfigModName.c_str())) {
+            // Closed elsewhere (X/Escape below, or a notification-mode
+            // switch via ModKit_CloseAllConfigWindows) - stop drawing.
+            g_openConfigModName.clear();
+            return;
+        }
+
+        char title[128] = {};
+        ModKitInterop::GetConfigWindowTitle(g_openConfigModName.c_str(), title, sizeof(title));
+        int rowCount = ModKitInterop::GetConfigWindowRowCount(g_openConfigModName.c_str());
+
+        const float STATUS_WIDTH = 280; // must match DrawStatusPanel's own WIDTH above
+        const float WIDTH = 280, PAD = 10, HEADER_H = 30;
+
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 22 + STATUS_WIDTH + 8, vp->WorkPos.y + 56), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(WIDTH, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(1.0f);
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMove;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, Colors::BG);
+        ImGui::PushStyleColor(ImGuiCol_Text, Colors::TEXT);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+
+        std::string winId = "##ConfigWindow_" + g_openConfigModName;
+        if (ImGui::Begin(winId.c_str(), nullptr, flags)) {
+            bool closeRequested = false;
+            if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Escape))
+                closeRequested = true;
+
+            ImVec2 winPos = ImGui::GetWindowPos();
+            ImDrawList* winDl = ImGui::GetWindowDrawList();
+            winDl->AddRectFilled(winPos, ImVec2(winPos.x + WIDTH, winPos.y + 3), Colors::ACCENT);
+            winDl->AddText(ImVec2(winPos.x + PAD, winPos.y + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
+                Colors::ACCENT, title[0] ? title : g_openConfigModName.c_str());
+
+            // Close ("x") button, top-right of the header.
+            {
+                float xW = ImGui::CalcTextSize("x").x + 10;
+                ImVec2 xPos(winPos.x + WIDTH - xW, winPos.y + 4);
+                ImGui::SetCursorScreenPos(xPos);
+                ImGui::PushID("closeConfigBtn");
+                if (ImGui::InvisibleButton("close", ImVec2(xW, HEADER_H - 8)))
+                    closeRequested = true;
+                bool xHovered = ImGui::IsItemHovered();
+                winDl->AddText(xPos, xHovered ? Colors::TEXT : Colors::DISABLED_TEXT, "x");
+                ImGui::PopID();
+            }
+
+            if (closeRequested) {
+                ModKitInterop::CloseConfigWindowFromOverlay(g_openConfigModName.c_str());
+                g_openConfigModName.clear();
+            }
+            else {
+                ImGui::SetCursorPos(ImVec2(PAD, HEADER_H + 6));
+
+                if (rowCount == 0) {
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "No settings");
+                }
+
+                float contentW = WIDTH - PAD * 2;
+                for (int i = 0; i < rowCount; ++i) {
+                    ModKitInterop::ModKitConfigRowView row = {};
+                    if (!ModKitInterop::GetConfigWindowRow(g_openConfigModName.c_str(), i, &row)) continue;
+
+                    ImGui::SetCursorPosX(PAD);
+                    ImGui::PushID(i);
+
+                    switch (row.type) {
+                    case ModKitInterop::MODKIT_ROW_TOGGLE: {
+                        bool on = row.valueText[0] == '1';
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::SameLine(contentW - 30);
+                        if (ImGui::Checkbox("##t", &on))
+                            ModKitInterop::SetConfigWindowToggle(g_openConfigModName.c_str(), i);
+                        break;
+                    }
+                    case ModKitInterop::MODKIT_ROW_FLOAT: {
+                        // Re-read the authoritative value fresh every frame
+                        // rather than keeping our own edit buffer - this
+                        // only actually changes right after a successful
+                        // Apply (Enter), never mid-keystroke, so it doesn't
+                        // fight ImGui's own internal active-edit text state
+                        // the way a value that changed every frame would.
+                        float val = (float)atof(row.valueText);
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::SetNextItemWidth(contentW);
+                        if (ImGui::InputFloat("##f", &val, 0, 0, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue))
+                            ModKitInterop::SetConfigWindowFloat(g_openConfigModName.c_str(), i, val);
+                        break;
+                    }
+                    case ModKitInterop::MODKIT_ROW_INT: {
+                        int val = atoi(row.valueText);
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::SetNextItemWidth(contentW);
+                        if (ImGui::InputInt("##i", &val, 0, 0, ImGuiInputTextFlags_EnterReturnsTrue))
+                            ModKitInterop::SetConfigWindowInt(g_openConfigModName.c_str(), i, val);
+                        break;
+                    }
+                    case ModKitInterop::MODKIT_ROW_DROPDOWN: {
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::SetNextItemWidth(contentW);
+                        if (ImGui::BeginCombo("##d", row.valueText)) {
+                            for (int oi = 0; oi < row.dropdownCount; ++oi) {
+                                char opt[64] = {};
+                                if (!ModKitInterop::GetConfigWindowDropdownOption(g_openConfigModName.c_str(), i, oi, opt, sizeof(opt)))
+                                    continue;
+                                bool selected = strcmp(opt, row.valueText) == 0;
+                                if (ImGui::Selectable(opt, selected))
+                                    ModKitInterop::SetConfigWindowDropdown(g_openConfigModName.c_str(), i, oi);
+                            }
+                            ImGui::EndCombo();
+                        }
+                        break;
+                    }
+                    case ModKitInterop::MODKIT_ROW_STATUS:
+                    default:
+                        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "%s", row.valueText);
+                        break;
+                    }
+
+                    ImGui::PopID();
+                    ImGui::Dummy(ImVec2(0, 4));
+                }
+                ImGui::Dummy(ImVec2(0, 4));
+            }
         }
         ImGui::End();
         ImGui::PopStyleVar();
@@ -679,6 +905,11 @@ namespace Overlay {
 
         if (!g_channel2Enabled && g_statusPanelOpen) CloseStatusPanel();
 
+        // Apply the deferred cursor-draw-mode flag here - the one place
+        // it's ever safe to touch ImGui's io struct (render thread, between
+        // NewFrame() and Render()) - see g_wantMouseDrawCursor's own comment.
+        ImGui::GetIO().MouseDrawCursor = g_wantMouseDrawCursor;
+
         // Render-thread-only anchor cleanup - see g_anchorTitleSet's comment.
         // Runs regardless of g_channel2Enabled so a channel-2-disable close
         // (the line above) still gets its anchor cleared.
@@ -694,6 +925,12 @@ namespace Overlay {
         DrawToastStack(); // safe even if g_channel2Enabled just went false — Prune() drains the stack
 
         if (g_channel2Enabled && g_statusPanelOpen) DrawStatusPanel(rows);
+        // Gated the same as the status panel now - a config window hides
+        // (stops drawing) when INSERT closes and reappears in the same
+        // spot when it reopens, rather than staying independently visible.
+        // Nothing about its underlying state (rows, values, which mod)
+        // changes while hidden - see g_openConfigModName's own comment.
+        if (g_channel2Enabled && g_statusPanelOpen) DrawConfigPanel();
     }
 
 } // namespace Overlay

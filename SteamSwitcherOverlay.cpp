@@ -60,6 +60,16 @@ namespace {
         Logging::LogFmt("[SteamSwitcherOverlay] Toast queued: %s", text.c_str());
     }
 
+    void OnCloseConfigWindows() {
+        // See ModKit.h's ModKit_CloseAllConfigWindows for the full design -
+        // this is the eager, mode-switch-triggered close, sent the instant
+        // SteamSwitcher's NotificationMode dropdown changes (mirrors
+        // _overlay.CloseOverlay()/CloseStatusPanel() firing at the same
+        // moment on the C# side, see ModsPanel.cs's
+        // Cmb_notificationMode_Changed).
+        ModKitInterop::CloseAllConfigWindows();
+    }
+
     DWORD WINAPI StartupWorkerThreadProc(LPVOID) {
         // No PID-guard check here — see this file's own header comment.
         // Under production (SteamSwitcher's own LoadLibraryA), the OS
@@ -73,7 +83,7 @@ namespace {
         // review — see OVERLAY-REDESIGN-RESULT.md.
         Logging::LogFmt("[SteamSwitcherOverlay] Startup worker running, pid=%lu", GetCurrentProcessId());
         HotkeyPoll::Start(&OnHotkeyToggle);
-        OverlayPipe::Start(&OnSetModChannel, &OnToast);
+        OverlayPipe::Start(&OnSetModChannel, &OnToast, &OnCloseConfigWindows);
         PresentHookKit::InstallAll();
         return 0;
     }
