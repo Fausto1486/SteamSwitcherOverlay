@@ -16,14 +16,15 @@ It is not a standalone tool. It's designed to be injected by SteamSwitcher itsel
 6. [DX12 Queue Capture](#dx12-queue-capture)
 7. [Data Flow: ModKit → Overlay](#data-flow-modkit--overlay)
 8. [In-Game Config Windows](#in-game-config-windows)
-9. [Attach Lifecycle](#attach-lifecycle)
-10. [Pipe Protocol](#pipe-protocol)
-11. [Hotkey](#hotkey)
-12. [Logging](#logging)
-13. [Known Limitations](#known-limitations)
-14. [Deployment Layout](#deployment-layout)
-15. [Build Notes](#build-notes)
-16. [Safety Scope](#safety-scope)
+9. [Session Header, Dim Backdrop, and Logs Button](#session-header-dim-backdrop-and-logs-button)
+10. [Attach Lifecycle](#attach-lifecycle)
+11. [Pipe Protocol](#pipe-protocol)
+12. [Hotkey](#hotkey)
+13. [Logging](#logging)
+14. [Known Limitations](#known-limitations)
+15. [Deployment Layout](#deployment-layout)
+16. [Build Notes](#build-notes)
+17. [Safety Scope](#safety-scope)
 
 ---
 
@@ -76,11 +77,11 @@ SteamSwitcher injects this DLL the exact same way it injects `ModKit.dll` — `C
 
 | Backend | Status |
 |---|---|
-| DX9 | Implemented, fully functional per code, but **never confirmed against a real DX9 game**. Disabled in `InstallWorkerThreadProc`. Not known broken — genuinely untested. |
+| DX9 | **Shipping.** Confirmed working against a real DX9 game — installed unconditionally in `InstallWorkerThreadProc`, same as DX11. |
 | DX11 | **Shipping.** Confirmed stable across multiple real games, including Steam overlay present and fullscreen/exclusive-fullscreen transitions. |
 | DX12 | **Shipping**, on either of two render paths selected per-attach (`DX12::g_usingD3D11On12`, decided in `LazyInit`): a native `ImGui_ImplDX12` path by default, or a `D3D11On12` interop path specifically when NVIDIA Streamline (`sl.interposer.dll`) is present — see [DX12 Queue Capture](#dx12-queue-capture). |
 
-DX9 is fully implemented and left in the code (not deleted) behind a shipping-configuration gate in `PresentHookKit::InstallWorkerThreadProc` — re-enabling it requires its own real, repeated test pass before being trusted, not just flipping the gate.
+DX9 installs the same way DX11 does — a dummy-device hook attempt at startup that harmlessly no-ops (`DX9::Install()` logs "not installed (game likely doesn't use it)") if the process isn't actually using Direct3D9. No module-detection gate needed for it, matching DX11's own unconditional install.
 
 ---
 
@@ -147,6 +148,20 @@ Clicking a clickable row in the status panel doesn't just invoke the mod's butto
 
 ---
 
+## Session Header, Dim Backdrop, and Logs Button
+
+`DrawStatusPanel` (`OverlayContent.h`) grew a header block above the existing "MODS - click to configure" strip, mirroring SteamSwitcher's own `ModsStatusPanel.cs` (WinForms, Toast mode) feature-for-feature so both modes read as the same product:
+
+- **Game name, profile/persona name, and a live session timer.** Sourced from `SessionInfo` (`Overlay::g_session`), populated by `GAMEINFO|<name>|<epochMs>|<profile>` over `OverlayPipe` — sent by `ModsPanel.cs`'s `SendGameInfoToOverlay()` right after `SETMODCHANNEL|1`, at the same three points the Toast side calls `SetSessionInfo`: injection completing, the shared auto-inject/GOG continuation, and a live mode-switch to Overlay. `launchEpochMs` of `0` is the "unknown" sentinel — the timer line just doesn't draw.
+- **`DisplayProfileText`/`FormatElapsed`** are the exact same transforms `ModsStatusPanel.cs` applies — including stripping a leading `Run … on ` prefix from the profile name if present (some Steam vanity/persona names happen to read like a launcher string; splits at the *last* " on " so a genuinely-containing name is safe). Both modes show identical text for identical session data.
+- **Dynamic width.** `ComputeRequiredWidth`-equivalent logic measures the game name and profile+timer line via `ImGui::CalcTextSize` and widens the panel (up to a capped `MAX_WIDTH`) if either needs more room than the base width — same reasoning as the WinForms side, same cap-then-ellipsize fallback beyond that. `DrawConfigPanel` reads back `g_lastStatusPanelWidth` (set every frame by `DrawStatusPanel`) rather than a fixed constant, so it stays correctly positioned to the status panel's right edge regardless of how wide that edge currently is.
+- **A real drawn "Logs" button** (filled background, border, hover state — not just underlined text) in the header. Click sends `SHOWLOGS` via the new `OverlayCommandPipe.h` (mirrors `RemoteLog.h`'s shape: a fire-and-forget `CreateFileA`/`WriteFile` into a pipe SteamSwitcher hosts as server — `SteamSwitcherOverlayCmdPipe`, received by `OverlayCommandMonitor.cs`) to bring SteamSwitcher's Log window to the front, anchored near this panel's own on-screen position (the game window's rect, offset by the same `+22, +56` this panel places itself at).
+- **A dimmed backdrop** behind the panel while it's open, via `DrawDarkBackdrop()` on `ImGui::GetBackgroundDrawList()` — mirrors `ModsStatusPanel.cs`'s own `DimBackdrop` Form, just via ImGui's background draw list instead of a second Win32 window. Background-draw-list content always renders at the very bottom of the frame regardless of call order, so toasts (`DrawToastStack`, normal ImGui windows) are unaffected by construction, not because of where `DrawDarkBackdrop()` happens to be called from in `DrawOverlay`.
+
+Known Unicode limitation: `GAMEINFO`'s text now arrives as correct UTF-8 (an earlier bug had `OverlayPipeClient.cs` encoding pipe messages as ASCII, silently replacing every character above code point 127 with a literal `?` before the message even left SteamSwitcher — fixed by switching to `Encoding.UTF8.GetBytes`), but this project never loads a custom font or explicit Unicode glyph ranges into ImGui — it runs on ImGui's implicit default font, Basic Latin only. A persona name containing genuinely exotic glyphs (CJK, certain symbol blocks) still renders as ImGui's own missing-glyph fallback, a separate, unaddressed limitation from the encoding bug. The Toast/WinForms side has no such limitation, since it uses whatever system font Windows provides.
+
+---
+
 ## Attach Lifecycle
 
 Hooks install early and stay installed for the life of the process — proven safe. The actual attach work (device/context refs, ImGui context creation, backbuffer/RTV setup) is deliberately delayed until one of three explicit triggers fires `PresentHookKit::RequestAttach()`:
@@ -192,7 +207,6 @@ Under heavy concurrent load (e.g. several D3D12 queues on different engine threa
 
 ## Known Limitations
 
-- **DX9 is untested.** Implemented, never confirmed against a real DX9 game.
 - **DX12 + NVIDIA Streamline Present-correlation is probabilistic, not authoritative.** The fix (see [DX12 Queue Capture](#dx12-queue-capture)) resolves the real presentation queue by timing correlation, not by direct API observation — a real signal, not a guarantee. If correlation ever comes back inconclusive on a given game, the DLL correctly refuses to attach rather than guess (`g_queueResolvedSuccessfully == false` in `DX12::LazyInit`) — that's a missing overlay, not a crash, and is the expected/safe failure mode, not a regression to chase. `PresentHookKit.h`'s `g_refuseAttachOnStreamlineForTesting` (default `false`) instantly restores the old unconditional refuse-on-Streamline behavior if this path ever needs isolating again.
 - **32-bit games are not supported.** This DLL, MinHook, and ImGui are all architecture-agnostic C/C++ in principle, but there is no 32-bit build or 32-bit-aware injection path — SteamSwitcher falls back to its toast/notification path for 32-bit games.
 - **`ModKitInterop.h`'s resolved exports assume they might not exist.** The header comment describing this file was written when `ModKit_HasButton`/`ClickButton`/`IsPoolSearching`/`IsPoolClearing` were not yet exported from `ModKit.dll`. All of these, plus the full config-window overlay bridge, are exported now (see the `ModKit` project's own README — Host Integration Helpers, [Config Window Overlay Bridge](../ModKit/README.md#config-window-overlay-bridge)) — the `GetProcAddress` approach still stands (no build-time link is still the right call for two independently-versioned DLLs), but the "these don't exist yet" framing in that file's comments is stale. Every unresolved export still degrades to a safe default (non-clickable rows, no config panel), consistent with the rest of this file's design.
