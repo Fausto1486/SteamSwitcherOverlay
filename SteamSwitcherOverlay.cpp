@@ -30,6 +30,7 @@
 // and closes that class of risk regardless of which injection path is used.
 
 #include <Windows.h>
+#include <cstdint>
 #include <string>
 #include "Logging.h"
 #include "PresentHookKit.h"
@@ -70,6 +71,17 @@ namespace {
         ModKitInterop::CloseAllConfigWindows();
     }
 
+    void OnGameInfo(const std::string& gameName, int64_t launchEpochMs, const std::string& profileName) {
+        // No PresentHookKit::RequestAttach() here, unlike OnToast/
+        // OnSetModChannel(true) above - GAMEINFO is always sent right after
+        // SETMODCHANNEL|1 (see ModsPanel.cs's SendGameInfoToOverlay call
+        // site), which already triggers attach on its own. This just needs
+        // to update the header data itself for whenever the panel next
+        // draws.
+        Overlay::g_session.Set(gameName, launchEpochMs, profileName);
+        Logging::LogFmt("[SteamSwitcherOverlay] GAMEINFO: %s (profile=%s)", gameName.c_str(), profileName.c_str());
+    }
+
     DWORD WINAPI StartupWorkerThreadProc(LPVOID) {
         // No PID-guard check here — see this file's own header comment.
         // Under production (SteamSwitcher's own LoadLibraryA), the OS
@@ -83,7 +95,7 @@ namespace {
         // review — see OVERLAY-REDESIGN-RESULT.md.
         Logging::LogFmt("[SteamSwitcherOverlay] Startup worker running, pid=%lu", GetCurrentProcessId());
         HotkeyPoll::Start(&OnHotkeyToggle);
-        OverlayPipe::Start(&OnSetModChannel, &OnToast, &OnCloseConfigWindows);
+        OverlayPipe::Start(&OnSetModChannel, &OnToast, &OnCloseConfigWindows, &OnGameInfo);
         PresentHookKit::InstallAll();
         return 0;
     }

@@ -137,5 +137,8 @@
     <ClInclude Include="RemoteLog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="OverlayCommandPipe.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

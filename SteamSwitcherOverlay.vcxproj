@@ -198,6 +198,7 @@
     <ClInclude Include="MinHook\src\hde\table64.h" />
     <ClInclude Include="MinHook\src\trampoline.h" />
     <ClInclude Include="ModKitInterop.h" />
+    <ClInclude Include="OverlayCommandPipe.h" />
     <ClInclude Include="OverlayContent.h" />
     <ClInclude Include="OverlayPipe.h" />
     <ClInclude Include="PresentHookKit.h" />

@@ -20,11 +20,30 @@
 //                                         CloseStatusPanel() on the C# side -
 //                                         see ModsPanel.cs's
 //                                         Cmb_notificationMode_Changed.
+//   GAMEINFO|<name>|<epochMs>|<profile> — session info for the status
+//                                         panel's header (game name, launch
+//                                         time, profile/persona name), sent
+//                                         from ModsPanel.cs's
+//                                         SendGameInfoToOverlay right after
+//                                         SETMODCHANNEL|1. Mirrors
+//                                         ModsStatusPanel.cs's own
+//                                         SetSessionInfo on the Toast side —
+//                                         same three fields, same meaning.
+//                                         epochMs of 0 means "unknown, don't
+//                                         show a timer line". Parsed from
+//                                         the right (last field = profile,
+//                                         next = epochMs, remainder = name)
+//                                         rather than naive left-to-right
+//                                         splitting, so a game name that
+//                                         happens to contain '|' doesn't
+//                                         corrupt the fields after it — this
+//                                         is not escaped on the sending side.
 //
 // Extend the dispatch table below as real Channel-1 use cases emerge —
 // don't over-design placeholder message types now, per the blueprint.
 
 #include <Windows.h>
+#include <cstdint>
 #include <string>
 #include "Logging.h"
 
@@ -37,6 +56,7 @@ namespace OverlayPipe {
     inline void (*g_onSetModChannel)(bool enabled) = nullptr;
     inline void (*g_onToast)(const std::string& text) = nullptr;
     inline void (*g_onCloseConfigWindows)() = nullptr;
+    inline void (*g_onGameInfo)(const std::string& gameName, int64_t launchEpochMs, const std::string& profileName) = nullptr;
 
     // StartsWith dispatch, one callback per message type — same shape as
     // ModPipeMonitor.cs/CmdPipeThread elsewhere in this codebase, per the
@@ -56,6 +76,27 @@ namespace OverlayPipe {
         else if (msg.rfind("CLOSECONFIGWINDOWS", 0) == 0) {
             if (g_onCloseConfigWindows) g_onCloseConfigWindows();
             Logging::LogFmt("[OverlayPipe] CLOSECONFIGWINDOWS");
+        }
+        else if (msg.rfind("GAMEINFO|", 0) == 0) {
+            std::string rest = msg.substr(9);
+
+            // Split from the right - see this file's own header comment on
+            // GAMEINFO for why (an un-escaped '|' inside the game name
+            // shouldn't be able to corrupt the fields after it).
+            size_t lastPipe = rest.rfind('|');
+            std::string profile = (lastPipe != std::string::npos) ? rest.substr(lastPipe + 1) : "";
+            std::string rest2 = (lastPipe != std::string::npos) ? rest.substr(0, lastPipe) : rest;
+
+            size_t secondPipe = rest2.rfind('|');
+            std::string epochStr = (secondPipe != std::string::npos) ? rest2.substr(secondPipe + 1) : rest2;
+            std::string gameName = (secondPipe != std::string::npos) ? rest2.substr(0, secondPipe) : "";
+
+            int64_t epochMs = 0;
+            try { epochMs = std::stoll(epochStr); }
+            catch (...) { epochMs = 0; } // malformed - treat as "unknown", not a crash
+
+            if (g_onGameInfo) g_onGameInfo(gameName, epochMs, profile);
+            Logging::LogFmt("[OverlayPipe] GAMEINFO: %s (profile=%s)", gameName.c_str(), profile.c_str());
         }
         else {
             Logging::LogFmt("[OverlayPipe] Unrecognized message: %s", msg.c_str());
@@ -98,12 +139,14 @@ namespace OverlayPipe {
     }
 
     inline void Start(void (*onSetModChannel)(bool), void (*onToast)(const std::string&),
-        void (*onCloseConfigWindows)())
+        void (*onCloseConfigWindows)(),
+        void (*onGameInfo)(const std::string&, int64_t, const std::string&))
     {
         if (g_running) return;
         g_onSetModChannel = onSetModChannel;
         g_onToast = onToast;
         g_onCloseConfigWindows = onCloseConfigWindows;
+        g_onGameInfo = onGameInfo;
         g_running = true;
         HANDLE h = CreateThread(nullptr, 0, ServerThreadProc, nullptr, 0, nullptr);
         if (h) {

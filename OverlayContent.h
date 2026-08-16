@@ -38,6 +38,7 @@
 #include "SharedDataReader.h"
 #include "ModKitInterop.h"
 #include "Logging.h"
+#include "OverlayCommandPipe.h"
 #include "imgui.h"
 #include <Windows.h>
 #include <string>
@@ -47,6 +48,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <regex>
 
 namespace Overlay {
 
@@ -80,12 +82,95 @@ namespace Overlay {
         static const ImU32 TOAST_ACC_OUT = Col(200, 150, 40);
         static const ImU32 TOAST_ACC_SCAN = Col(80, 150, 220);
         static const ImU32 TOAST_ACC_INFO = Col(150, 150, 160);
+
+        // Session info block (game name/profile/timer/Logs button) - mirrors
+        // ModsStatusPanel.cs's own palette exactly (INFO_ACCENT, INFO_DIM,
+        // LOGS_BTN_*, DIM_BACKDROP) so Toast and Overlay modes read as the
+        // same feature, just rendered in two different toolkits.
+        static const ImU32 INFO_ACCENT = Col(220, 220, 230);
+        static const ImU32 INFO_DIM = Col(150, 150, 160);
+        static const ImU32 LOGS_BTN_BG = Col(34, 34, 42);
+        static const ImU32 LOGS_BTN_BG_HOVER = Col(50, 50, 62);
+        static const ImU32 LOGS_BTN_BORDER = Col(90, 90, 105);
+        static const ImU32 LOGS_BTN_TEXT = Col(200, 210, 230);
+        static const ImU32 DIM_BACKDROP = Col(0, 0, 0, 140);
     }
 
     // ── Channel 2 (mod content) gate — set by OverlayPipe's SETMODCHANNEL.
     // Replaces the archive's "overlay.mode" shared-data key check. ───────────
     inline bool g_channel2Enabled = false;
     inline void SetChannel2Enabled(bool enabled) { g_channel2Enabled = enabled; }
+
+    // ── Session info — game name/profile/launch time for the status panel's
+    // header, set by OverlayPipe's GAMEINFO (SteamSwitcher-side pipe
+    // thread), read every frame by DrawStatusPanel (render thread). Same
+    // CRITICAL_SECTION + Snapshot pattern as ToastState below, for the same
+    // reason: never hold the lock while calling into ImGui. Mirrors
+    // ModsStatusPanel.cs's own _gameName/_profileName/_launchTimeUtc fields
+    // set via SetSessionInfo — same three values, same meaning, just
+    // arriving over a pipe here instead of a direct in-process call.
+    struct SessionInfo {
+        std::string gameName;
+        std::string profileName;
+        int64_t launchEpochMs = 0;   // 0 = unknown, see OverlayPipe.h's GAMEINFO doc
+        CRITICAL_SECTION lock;
+
+        SessionInfo() { InitializeCriticalSection(&lock); }
+        ~SessionInfo() { DeleteCriticalSection(&lock); }
+
+        void Set(const std::string& name, int64_t epochMs, const std::string& profile) {
+            EnterCriticalSection(&lock);
+            gameName = name;
+            launchEpochMs = epochMs;
+            profileName = profile;
+            LeaveCriticalSection(&lock);
+        }
+
+        struct Snapshot { std::string gameName, profileName; int64_t launchEpochMs; };
+        Snapshot Get() {
+            EnterCriticalSection(&lock);
+            Snapshot s{ gameName, profileName, launchEpochMs };
+            LeaveCriticalSection(&lock);
+            return s;
+        }
+    };
+    inline SessionInfo g_session;
+
+    inline bool HasInfoBlock(const SessionInfo::Snapshot& s) { return !s.gameName.empty(); }
+
+    // Last width DrawStatusPanel actually rendered at, so DrawConfigPanel
+    // (positioned immediately to its right) can stay correctly aligned now
+    // that the status panel's width is dynamic (see DrawStatusPanel's own
+    // WIDTH computation) rather than the old fixed 280. Render-thread-only,
+    // same as everything else these two functions share - no locking needed.
+    inline float g_lastStatusPanelWidth = 280.0f;
+
+    inline std::string FormatElapsed(int64_t launchEpochMs) {
+        if (launchEpochMs <= 0) return "";
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        int64_t elapsedSec = (nowMs - launchEpochMs) / 1000;
+        if (elapsedSec < 0) elapsedSec = 0;
+        int64_t h = elapsedSec / 3600, m = (elapsedSec % 3600) / 60, s = elapsedSec % 60;
+        char buf[32];
+        if (h > 0) snprintf(buf, sizeof(buf), "%lld:%02lld:%02lld", (long long)h, (long long)m, (long long)s);
+        else snprintf(buf, sizeof(buf), "%lld:%02lld", (long long)m, (long long)s);
+        return buf;
+    }
+
+    // Strips a leading "Run <anything> on " prefix from the profile name
+    // before display, if present - see ModsStatusPanel.cs's own
+    // DisplayProfileText for the full reasoning (the game name is already
+    // shown as this panel's own header, so a profile/persona name that
+    // itself happens to read like "Run <game> on <name>" would otherwise
+    // repeat it). Same greedy-middle regex behavior: splits at the LAST
+    // " on ", not the first, so a genuine name containing " on " is safe.
+    inline std::string DisplayProfileText(const std::string& profileName) {
+        static const std::regex kRunOnPrefix(R"(^Run\s+.+\son\s+(.+)$)");
+        std::smatch m;
+        if (std::regex_match(profileName, m, kRunOnPrefix)) return m[1].str();
+        return profileName;
+    }
 
     // ── Per-mod row, read fresh every frame from SharedDataReader ────────────
     struct ModRow {
@@ -631,7 +716,33 @@ namespace Overlay {
     inline void DrawStatusPanel(const std::vector<ModRow>& rows) {
         ForceCursorUsable(); // re-assert every frame - see this state's own comment above
 
-        const float WIDTH = 280, ROW_H = 26, PAD = 10, HEADER_H = 30;
+        const float WIDTH_BASE = 280, MAX_WIDTH = 460, ROW_H = 26, PAD = 10, HEADER_H = 30;
+        const float INFO_H = 44, INFO_LINE_H = 20, LOGS_BTN_W = 52, LOGS_BTN_H = 18;
+
+        // Dynamic width, mirroring ModsStatusPanel.cs's ComputeRequiredWidth:
+        // widen past WIDTH_BASE (up to MAX_WIDTH) when the game name or
+        // profile/timer line needs more room, so text doesn't overlap or
+        // ellipsize unnecessarily on a panel that had space to just be
+        // wider. DisplayProfileText/FormatElapsed are the exact same
+        // transforms the Toast-mode panel applies, so both modes show
+        // identical text for identical session data.
+        auto sess = g_session.Get();
+        bool hasInfo = HasInfoBlock(sess);
+        std::string profileText = hasInfo ? DisplayProfileText(sess.profileName) : "";
+        std::string timeText = hasInfo ? FormatElapsed(sess.launchEpochMs) : "";
+        float WIDTH = WIDTH_BASE;
+        if (hasInfo) {
+            float line1 = PAD + ImGui::CalcTextSize(sess.gameName.c_str()).x + 8 + LOGS_BTN_W + PAD;
+            WIDTH = (std::max)(WIDTH, line1);
+            if (!profileText.empty() || !timeText.empty()) {
+                float line2 = PAD + ImGui::CalcTextSize(profileText.c_str()).x + 8
+                    + ImGui::CalcTextSize(timeText.c_str()).x + PAD;
+                WIDTH = (std::max)(WIDTH, line2);
+            }
+            WIDTH = (std::min)(WIDTH, MAX_WIDTH);
+        }
+        float infoTop = hasInfo ? INFO_H : 0.0f;
+        g_lastStatusPanelWidth = WIDTH;
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 22, vp->WorkPos.y + 56), ImGuiCond_Always);
@@ -651,10 +762,41 @@ namespace Overlay {
 
             ImVec2 winPos = ImGui::GetWindowPos();
             ImDrawList* winDl = ImGui::GetWindowDrawList();
-            winDl->AddRectFilled(winPos, ImVec2(winPos.x + WIDTH, winPos.y + 3), Colors::ACCENT);
-            winDl->AddText(ImVec2(winPos.x + PAD, winPos.y + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
+
+            // Session info block - game name + Logs button (line 1), profile
+            // name + elapsed time (line 2). Mirrors ModsStatusPanel.cs's own
+            // INFO_H block layout/colors exactly - see Colors namespace.
+            if (hasInfo) {
+                winDl->AddText(ImVec2(winPos.x + PAD, winPos.y + 2 + (INFO_LINE_H - ImGui::GetTextLineHeight()) / 2),
+                    Colors::INFO_ACCENT, sess.gameName.c_str());
+
+                ImVec2 btnMin(winPos.x + WIDTH - PAD - LOGS_BTN_W, winPos.y + 2 + (INFO_LINE_H - LOGS_BTN_H) / 2);
+                ImVec2 btnMax(btnMin.x + LOGS_BTN_W, btnMin.y + LOGS_BTN_H);
+                bool logsHovered = ImGui::IsMouseHoveringRect(btnMin, btnMax);
+                winDl->AddRectFilled(btnMin, btnMax, logsHovered ? Colors::LOGS_BTN_BG_HOVER : Colors::LOGS_BTN_BG);
+                winDl->AddRect(btnMin, btnMax, Colors::LOGS_BTN_BORDER);
+                ImVec2 logsTextSize = ImGui::CalcTextSize("Logs");
+                winDl->AddText(ImVec2(btnMin.x + (LOGS_BTN_W - logsTextSize.x) / 2, btnMin.y + (LOGS_BTN_H - logsTextSize.y) / 2),
+                    Colors::LOGS_BTN_TEXT, "Logs");
+                ImGui::SetCursorScreenPos(btnMin);
+                ImGui::InvisibleButton("##logsBtn", ImVec2(LOGS_BTN_W, LOGS_BTN_H));
+                if (ImGui::IsItemClicked()) OverlayCommandPipe::SendShowLogs();
+
+                if (!profileText.empty() || !timeText.empty()) {
+                    float line2Y = winPos.y + INFO_LINE_H + 2 + (INFO_LINE_H - ImGui::GetTextLineHeight()) / 2;
+                    if (!profileText.empty())
+                        winDl->AddText(ImVec2(winPos.x + PAD, line2Y), Colors::INFO_DIM, profileText.c_str());
+                    if (!timeText.empty()) {
+                        float tw = ImGui::CalcTextSize(timeText.c_str()).x;
+                        winDl->AddText(ImVec2(winPos.x + WIDTH - PAD - tw, line2Y), Colors::INFO_DIM, timeText.c_str());
+                    }
+                }
+            }
+
+            winDl->AddRectFilled(ImVec2(winPos.x, winPos.y + infoTop), ImVec2(winPos.x + WIDTH, winPos.y + infoTop + 3), Colors::ACCENT);
+            winDl->AddText(ImVec2(winPos.x + PAD, winPos.y + infoTop + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
                 Colors::ACCENT, "MODS - click to configure");
-            ImGui::SetCursorPos(ImVec2(PAD, HEADER_H));
+            ImGui::SetCursorPos(ImVec2(PAD, infoTop + HEADER_H));
 
             if (rows.empty()) {
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "No mods injected");
@@ -754,7 +896,7 @@ namespace Overlay {
         ModKitInterop::GetConfigWindowTitle(g_openConfigModName.c_str(), title, sizeof(title));
         int rowCount = ModKitInterop::GetConfigWindowRowCount(g_openConfigModName.c_str());
 
-        const float STATUS_WIDTH = 280; // must match DrawStatusPanel's own WIDTH above
+        const float STATUS_WIDTH = g_lastStatusPanelWidth; // stays aligned with DrawStatusPanel's own dynamic WIDTH
         const float WIDTH = 280, PAD = 10, HEADER_H = 30;
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -893,6 +1035,21 @@ namespace Overlay {
     // ── Entry point — called once per frame from PresentHookKit's hook.
     // Gated by g_channel2Enabled (SteamSwitcher's SETMODCHANNEL pipe
     // message) instead of the archive's "overlay.mode" shared-data key. ────
+    // Dimmed backdrop behind the status panel (and config panel, when open) -
+    // mirrors ModsStatusPanel.cs's own DimBackdrop Form exactly in effect,
+    // just via ImGui's background draw list instead of a second Win32
+    // window. GetBackgroundDrawList() content always renders at the very
+    // bottom of the frame regardless of call order, before any ImGui
+    // window's own content - toasts (drawn as normal ImGui windows via
+    // DrawToastStack) are therefore always layered above this dim
+    // unconditionally, by construction, not because of where this function
+    // happens to be called from in DrawOverlay below.
+    inline void DrawDarkBackdrop() {
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        dl->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), Colors::DIM_BACKDROP);
+    }
+
     inline void DrawOverlay() {
         // Teardown handshake - see RequestAnchorDestroyAndWait()'s comment.
         // Takes priority over everything else this frame: we're mid-unload.
@@ -924,6 +1081,7 @@ namespace Overlay {
         if (g_channel2Enabled) DiffAndPushToasts(rows);
         DrawToastStack(); // safe even if g_channel2Enabled just went false — Prune() drains the stack
 
+        if (g_channel2Enabled && g_statusPanelOpen) DrawDarkBackdrop();
         if (g_channel2Enabled && g_statusPanelOpen) DrawStatusPanel(rows);
         // Gated the same as the status panel now - a config window hides
         // (stops drawing) when INSERT closes and reappears in the same
