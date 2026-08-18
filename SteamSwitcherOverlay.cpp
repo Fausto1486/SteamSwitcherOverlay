@@ -70,6 +70,12 @@ namespace {
         // Cmb_notificationMode_Changed).
         ModKitInterop::CloseAllConfigWindows();
         ModKitInterop::CloseAllStatsWindows();
+        // Defers clearing the overlay's own g_openConfigPanels/
+        // g_openStatsPanels to the render thread - see
+        // g_pendingPanelListClear's own comment for why this can't just
+        // clear() them directly from here (this runs on OverlayPipe's
+        // dispatch thread, not the render thread that owns those lists).
+        Overlay::g_pendingPanelListClear = true;
     }
 
     void OnGameInfo(const std::string& gameName, int64_t launchEpochMs, const std::string& profileName) {
