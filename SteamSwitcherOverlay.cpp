@@ -69,6 +69,7 @@ namespace {
         // moment on the C# side, see ModsPanel.cs's
         // Cmb_notificationMode_Changed).
         ModKitInterop::CloseAllConfigWindows();
+        ModKitInterop::CloseAllStatsWindows();
     }
 
     void OnGameInfo(const std::string& gameName, int64_t launchEpochMs, const std::string& profileName) {

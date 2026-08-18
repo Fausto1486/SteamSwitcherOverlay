@@ -64,6 +64,51 @@ namespace ModKitInterop {
     typedef void (*CloseConfigWindowFromOverlay_t)(const char*);
     typedef void (*CloseAllConfigWindows_t)();
 
+    // Stats-window overlay bridge — mirrors ModKit.h's "STATS WINDOW OVERLAY
+    // BRIDGE" section. ModKitStatsRowView is a byte-for-byte copy of
+    // ModKitStatsRowView in ModKit.h, same no-header-include philosophy as
+    // ModKitConfigRowView above.
+    enum ModKitStatsRowType {
+        MODKIT_STATS_DIVIDER = 0,
+        MODKIT_STATS_BAR = 1,
+        MODKIT_STATS_TEXT = 2,
+        MODKIT_STATS_EDIT = 3,
+        MODKIT_STATS_BUTTON = 4,
+        MODKIT_STATS_CHECKBOX = 5,
+        MODKIT_STATS_DROPDOWN = 6,
+        MODKIT_STATS_COLUMN_BREAK = 7,
+    };
+
+    struct ModKitStatsRowView {
+        int  type;
+        char label[128];
+        char valueText[64];
+        float barFrac;
+        uint32_t barColor;
+        bool valid;
+        bool enabled;
+        bool checked;
+        int  dropdownCount;
+    };
+
+    typedef bool (*HasStatsWindow_t)(const char*);
+    typedef bool (*GetStatsWindowTitle_t)(const char*, char*, int);
+    typedef int  (*GetStatsWindowRowCount_t)(const char*);
+    typedef bool (*GetStatsWindowRow_t)(const char*, int, ModKitStatsRowView*);
+    typedef bool (*GetStatsWindowDropdownOption_t)(const char*, int, int, char*, int);
+    typedef void (*ClickStatsWindowButton_t)(const char*, int);
+    typedef void (*ToggleStatsWindowCheckbox_t)(const char*, int);
+    typedef void (*ChangeStatsWindowEdit_t)(const char*, int, const char*);
+    typedef void (*SelectStatsWindowDropdown_t)(const char*, int, int32_t);
+    typedef void (*CloseStatsWindowFromOverlay_t)(const char*);
+    typedef void (*CloseAllStatsWindows_t)();
+
+    // Persistent counterpart to ClickButtonForOverlay's per-call flag - see
+    // ModKit_IsOverlayModeActive's own comment in ModKit.h. Pushed every
+    // frame from DrawOverlay, not just on change, so it self-heals within
+    // one frame regardless of DLL load order.
+    typedef void (*SetOverlayModeActive_t)(bool);
+
     struct ResolvedFns {
         HasButton_t hasButton = nullptr;
         ClickButton_t clickButton = nullptr;
@@ -81,6 +126,18 @@ namespace ModKitInterop {
         SetConfigWindowDropdown_t setConfigWindowDropdown = nullptr;
         CloseConfigWindowFromOverlay_t closeConfigWindowFromOverlay = nullptr;
         CloseAllConfigWindows_t closeAllConfigWindows = nullptr;
+        HasStatsWindow_t hasStatsWindow = nullptr;
+        GetStatsWindowTitle_t getStatsWindowTitle = nullptr;
+        GetStatsWindowRowCount_t getStatsWindowRowCount = nullptr;
+        GetStatsWindowRow_t getStatsWindowRow = nullptr;
+        GetStatsWindowDropdownOption_t getStatsWindowDropdownOption = nullptr;
+        ClickStatsWindowButton_t clickStatsWindowButton = nullptr;
+        ToggleStatsWindowCheckbox_t toggleStatsWindowCheckbox = nullptr;
+        ChangeStatsWindowEdit_t changeStatsWindowEdit = nullptr;
+        SelectStatsWindowDropdown_t selectStatsWindowDropdown = nullptr;
+        CloseStatsWindowFromOverlay_t closeStatsWindowFromOverlay = nullptr;
+        CloseAllStatsWindows_t closeAllStatsWindows = nullptr;
+        SetOverlayModeActive_t setOverlayModeActive = nullptr;
         bool attempted = false; // re-attempt resolution each call until ModKit.dll is found —
         // it may load into this process after this DLL already has
     };
@@ -117,6 +174,18 @@ namespace ModKitInterop {
         if (!fns.setConfigWindowDropdown) fns.setConfigWindowDropdown = reinterpret_cast<SetConfigWindowDropdown_t>(GetProcAddress(hModKit, "ModKit_SetConfigWindowDropdown"));
         if (!fns.closeConfigWindowFromOverlay) fns.closeConfigWindowFromOverlay = reinterpret_cast<CloseConfigWindowFromOverlay_t>(GetProcAddress(hModKit, "ModKit_CloseConfigWindowFromOverlay"));
         if (!fns.closeAllConfigWindows) fns.closeAllConfigWindows = reinterpret_cast<CloseAllConfigWindows_t>(GetProcAddress(hModKit, "ModKit_CloseAllConfigWindows"));
+        if (!fns.hasStatsWindow) fns.hasStatsWindow = reinterpret_cast<HasStatsWindow_t>(GetProcAddress(hModKit, "ModKit_HasStatsWindow"));
+        if (!fns.getStatsWindowTitle) fns.getStatsWindowTitle = reinterpret_cast<GetStatsWindowTitle_t>(GetProcAddress(hModKit, "ModKit_GetStatsWindowTitle"));
+        if (!fns.getStatsWindowRowCount) fns.getStatsWindowRowCount = reinterpret_cast<GetStatsWindowRowCount_t>(GetProcAddress(hModKit, "ModKit_GetStatsWindowRowCount"));
+        if (!fns.getStatsWindowRow) fns.getStatsWindowRow = reinterpret_cast<GetStatsWindowRow_t>(GetProcAddress(hModKit, "ModKit_GetStatsWindowRow"));
+        if (!fns.getStatsWindowDropdownOption) fns.getStatsWindowDropdownOption = reinterpret_cast<GetStatsWindowDropdownOption_t>(GetProcAddress(hModKit, "ModKit_GetStatsWindowDropdownOption"));
+        if (!fns.clickStatsWindowButton) fns.clickStatsWindowButton = reinterpret_cast<ClickStatsWindowButton_t>(GetProcAddress(hModKit, "ModKit_ClickStatsWindowButton"));
+        if (!fns.toggleStatsWindowCheckbox) fns.toggleStatsWindowCheckbox = reinterpret_cast<ToggleStatsWindowCheckbox_t>(GetProcAddress(hModKit, "ModKit_ToggleStatsWindowCheckbox"));
+        if (!fns.changeStatsWindowEdit) fns.changeStatsWindowEdit = reinterpret_cast<ChangeStatsWindowEdit_t>(GetProcAddress(hModKit, "ModKit_ChangeStatsWindowEdit"));
+        if (!fns.selectStatsWindowDropdown) fns.selectStatsWindowDropdown = reinterpret_cast<SelectStatsWindowDropdown_t>(GetProcAddress(hModKit, "ModKit_SelectStatsWindowDropdown"));
+        if (!fns.closeStatsWindowFromOverlay) fns.closeStatsWindowFromOverlay = reinterpret_cast<CloseStatsWindowFromOverlay_t>(GetProcAddress(hModKit, "ModKit_CloseStatsWindowFromOverlay"));
+        if (!fns.closeAllStatsWindows) fns.closeAllStatsWindows = reinterpret_cast<CloseAllStatsWindows_t>(GetProcAddress(hModKit, "ModKit_CloseAllStatsWindows"));
+        if (!fns.setOverlayModeActive) fns.setOverlayModeActive = reinterpret_cast<SetOverlayModeActive_t>(GetProcAddress(hModKit, "ModKit_SetOverlayModeActive"));
     }
 
     inline bool HasButton(const char* modName) {
@@ -200,6 +269,66 @@ namespace ModKitInterop {
     inline void CloseAllConfigWindows() {
         EnsureResolved();
         if (Fns().closeAllConfigWindows) Fns().closeAllConfigWindows();
+    }
+
+    inline bool HasStatsWindow(const char* modName) {
+        EnsureResolved();
+        return Fns().hasStatsWindow ? Fns().hasStatsWindow(modName) : false;
+    }
+
+    inline bool GetStatsWindowTitle(const char* modName, char* outTitle, int outTitleSize) {
+        EnsureResolved();
+        return Fns().getStatsWindowTitle ? Fns().getStatsWindowTitle(modName, outTitle, outTitleSize) : false;
+    }
+
+    inline int GetStatsWindowRowCount(const char* modName) {
+        EnsureResolved();
+        return Fns().getStatsWindowRowCount ? Fns().getStatsWindowRowCount(modName) : 0;
+    }
+
+    inline bool GetStatsWindowRow(const char* modName, int rowIndex, ModKitStatsRowView* out) {
+        EnsureResolved();
+        return Fns().getStatsWindowRow ? Fns().getStatsWindowRow(modName, rowIndex, out) : false;
+    }
+
+    inline bool GetStatsWindowDropdownOption(const char* modName, int rowIndex, int optionIndex, char* outText, int outTextSize) {
+        EnsureResolved();
+        return Fns().getStatsWindowDropdownOption ? Fns().getStatsWindowDropdownOption(modName, rowIndex, optionIndex, outText, outTextSize) : false;
+    }
+
+    inline void ClickStatsWindowButton(const char* modName, int rowIndex) {
+        EnsureResolved();
+        if (Fns().clickStatsWindowButton) Fns().clickStatsWindowButton(modName, rowIndex);
+    }
+
+    inline void ToggleStatsWindowCheckbox(const char* modName, int rowIndex) {
+        EnsureResolved();
+        if (Fns().toggleStatsWindowCheckbox) Fns().toggleStatsWindowCheckbox(modName, rowIndex);
+    }
+
+    inline void ChangeStatsWindowEdit(const char* modName, int rowIndex, const char* text) {
+        EnsureResolved();
+        if (Fns().changeStatsWindowEdit) Fns().changeStatsWindowEdit(modName, rowIndex, text);
+    }
+
+    inline void SelectStatsWindowDropdown(const char* modName, int rowIndex, int32_t optionIndex) {
+        EnsureResolved();
+        if (Fns().selectStatsWindowDropdown) Fns().selectStatsWindowDropdown(modName, rowIndex, optionIndex);
+    }
+
+    inline void CloseStatsWindowFromOverlay(const char* modName) {
+        EnsureResolved();
+        if (Fns().closeStatsWindowFromOverlay) Fns().closeStatsWindowFromOverlay(modName);
+    }
+
+    inline void CloseAllStatsWindows() {
+        EnsureResolved();
+        if (Fns().closeAllStatsWindows) Fns().closeAllStatsWindows();
+    }
+
+    inline void SetOverlayModeActive(bool active) {
+        EnsureResolved();
+        if (Fns().setOverlayModeActive) Fns().setOverlayModeActive(active);
     }
 
 } // namespace ModKitInterop

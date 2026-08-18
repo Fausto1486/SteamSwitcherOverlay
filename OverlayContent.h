@@ -49,6 +49,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <regex>
+#include <array>
 
 namespace Overlay {
 
@@ -144,6 +145,47 @@ namespace Overlay {
     // WIDTH computation) rather than the old fixed 280. Render-thread-only,
     // same as everything else these two functions share - no locking needed.
     inline float g_lastStatusPanelWidth = 280.0f;
+
+    // ── Draggable sub-panels ─────────────────────────────────────────────────
+    // DrawConfigPanel/DrawStatsPanel draw their own header (no real ImGui
+    // title bar - ImGuiWindowFlags_NoTitleBar|NoMove, same as the status
+    // panel above them), so unlike Toast mode's equivalents (real win32
+    // windows with a real title bar - dragging is just the OS doing its
+    // normal thing there, no code needed) these need their own manual drag
+    // handling to match. One of these per draggable panel.
+    struct PanelDragState {
+        ImVec2 pos{};       // current top-left, screen coords
+        bool userMoved = false;   // true once dragged at least once since last (re)open - freezes auto-docking
+        bool dragging = false;    // mouse currently held down, drag in progress
+    };
+    inline PanelDragState g_configPanelDrag;
+    inline PanelDragState g_statsPanelDrag;
+
+    // Called once per frame, right after Begin() (needs the window's actual
+    // screen rect, which isn't known before then). headerMin/Max is the
+    // draggable strip's screen rect; closeButtonHovered excludes starting a
+    // drag from a click that's actually meant for the close button sharing
+    // that same strip. Mutates st.pos for the NEXT frame's SetNextWindowPos
+    // - one frame of lag between mouse movement and the window actually
+    // moving, imperceptible at real framerates, standard for a manual drag
+    // implementation in an immediate-mode GUI.
+    inline void UpdatePanelDrag(PanelDragState& st, const ImVec2& headerMin, const ImVec2& headerMax, bool closeButtonHovered) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (st.dragging) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                st.pos.x += io.MouseDelta.x;
+                st.pos.y += io.MouseDelta.y;
+            }
+            else {
+                st.dragging = false;
+            }
+        }
+        else if (!closeButtonHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            ImGui::IsMouseHoveringRect(headerMin, headerMax)) {
+            st.dragging = true;
+            st.userMoved = true;
+        }
+    }
 
     inline std::string FormatElapsed(int64_t launchEpochMs) {
         if (launchEpochMs <= 0) return "";
@@ -390,14 +432,30 @@ namespace Overlay {
     // render - set on a row click regardless of whether that mod actually
     // registered with the bridge; DrawConfigPanel's own HasConfigWindow
     // check no-ops harmlessly if it didn't (legacy/unrebuilt mod, native
-    // window instead - see TrackConfigWindowFor for that path). NOT cleared
-    // when the in-game panel closes (INSERT) - drawing is gated on
-    // g_statusPanelOpen at the call site instead (see DrawOverlay), so the
-    // config window "hides" and reappears in the same spot rather than
-    // resetting, same as the underlying ModKit.dll registration - only
+    // window instead - see TrackConfigWindowFor for that path). Also set by
+    // DrawOverlay's own auto-discovery fallback for a window opened by
+    // something other than a click (a mod's own hotkey). Independent of
+    // g_statusPanelOpen (the in-game INSERT panel's own visibility) - only
     // actually clears on an explicit close (X / Escape) or a
-    // notification-mode switch (ModKit_CloseAllConfigWindows).
+    // notification-mode switch (ModKit_CloseAllConfigWindows), same as the
+    // underlying ModKit.dll registration.
     inline std::string g_openConfigModName;
+
+    // Stats-window counterpart of g_openConfigModName above — set at the
+    // same row-click site (only whichever bridge the clicked mod actually
+    // registered with ends up non-empty in HasConfigWindow/HasStatsWindow,
+    // so both trackers safely coexist per click), or by DrawOverlay's own
+    // auto-discovery fallback for a window opened some other way (a mod's
+    // own hotkey). See g_openConfigModName's own comment for clearing.
+    inline std::string g_openStatsModName;
+
+    // Per-row edit buffers for DrawStatsPanel's MODKIT_STATS_EDIT rows,
+    // keyed by "modName#rowIndex" — ImGui::InputText needs a stable buffer
+    // across frames while the user is typing, so this is only refreshed
+    // from the live valueText when the widget isn't currently active
+    // (mirrors StatsWindowKit's own focus-based RefreshEditText guard on
+    // the native side).
+    inline std::unordered_map<std::string, std::array<char, 64>> g_statsEditBuffers;
 
     // ── Anchor window ────────────────────────────────────────────────────
     // ModConfigWindow.h (the per-mod config window, shared native C++ code)
@@ -678,7 +736,16 @@ namespace Overlay {
         if (!g_statusPanelOpen) return;
         g_statusPanelOpen = false;
         CloseTrackedConfigWindows();
-        RestoreCursor();
+        // NOT an unconditional RestoreCursor() here anymore - a config or
+        // stats window can still be independently open (see DrawOverlay's
+        // own end-of-frame cursor arbitration), and releasing cursor
+        // control out from under one of those while it's still visible
+        // would reproduce the exact flicker this whole mechanism exists to
+        // avoid. DrawOverlay's own check after every Draw*Panel call is the
+        // single place that decides "nothing is open anymore, actually
+        // let go" now.
+        if (g_openConfigModName.empty() && g_openStatsModName.empty())
+            RestoreCursor();
         // Anchor title is cleared from DrawOverlay() instead, on the render
         // thread - see g_anchorTitleSet's comment. This function is reachable
         // from HotkeyPoll's own thread (via ToggleStatusPanel), which must
@@ -846,6 +913,7 @@ namespace Overlay {
                         // TrackConfigWindowFor above stays the operative
                         // path for it, unchanged.
                         g_openConfigModName = row.modName;
+                        g_openStatsModName = row.modName;
                     }
                     ImGui::PopID();
                 }
@@ -889,8 +957,15 @@ namespace Overlay {
             // Closed elsewhere (X/Escape below, or a notification-mode
             // switch via ModKit_CloseAllConfigWindows) - stop drawing.
             g_openConfigModName.clear();
+            g_configPanelDrag.userMoved = false;   // next open re-docks fresh
             return;
         }
+        // Only from here on are we committed to actually drawing this frame
+        // - see ForceCursorUsable's own comment for why DrawStatusPanel
+        // gets to call this unconditionally at its own top and this one
+        // doesn't (this function, unlike that one, is no longer gated by
+        // the caller on whether there's actually anything to show).
+        ForceCursorUsable();
 
         char title[128] = {};
         ModKitInterop::GetConfigWindowTitle(g_openConfigModName.c_str(), title, sizeof(title));
@@ -900,7 +975,14 @@ namespace Overlay {
         const float WIDTH = 280, PAD = 10, HEADER_H = 30;
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 22 + STATUS_WIDTH + 8, vp->WorkPos.y + 56), ImGuiCond_Always);
+        // Auto-docked next to the status panel every frame until the user
+        // drags it away (UpdatePanelDrag, called below once the header's
+        // screen rect is known) - once that happens this stops overwriting
+        // g_configPanelDrag.pos, so it stays wherever they left it until
+        // the panel is closed and reopened fresh.
+        if (!g_configPanelDrag.userMoved)
+            g_configPanelDrag.pos = ImVec2(vp->WorkPos.x + 22 + STATUS_WIDTH + 8, vp->WorkPos.y + 56);
+        ImGui::SetNextWindowPos(g_configPanelDrag.pos, ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(WIDTH, 0), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(1.0f);
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -924,6 +1006,7 @@ namespace Overlay {
                 Colors::ACCENT, title[0] ? title : g_openConfigModName.c_str());
 
             // Close ("x") button, top-right of the header.
+            bool xHovered = false;
             {
                 float xW = ImGui::CalcTextSize("x").x + 10;
                 ImVec2 xPos(winPos.x + WIDTH - xW, winPos.y + 4);
@@ -931,14 +1014,20 @@ namespace Overlay {
                 ImGui::PushID("closeConfigBtn");
                 if (ImGui::InvisibleButton("close", ImVec2(xW, HEADER_H - 8)))
                     closeRequested = true;
-                bool xHovered = ImGui::IsItemHovered();
+                xHovered = ImGui::IsItemHovered();
                 winDl->AddText(xPos, xHovered ? Colors::TEXT : Colors::DISABLED_TEXT, "x");
                 ImGui::PopID();
             }
 
+            // Drag the whole colored header strip (minus the close button,
+            // excluded above via xHovered) to move the panel - see
+            // UpdatePanelDrag's own comment.
+            UpdatePanelDrag(g_configPanelDrag, winPos, ImVec2(winPos.x + WIDTH, winPos.y + HEADER_H), xHovered);
+
             if (closeRequested) {
                 ModKitInterop::CloseConfigWindowFromOverlay(g_openConfigModName.c_str());
                 g_openConfigModName.clear();
+                g_configPanelDrag.userMoved = false;   // next open re-docks fresh, matching a freshly-created native window
             }
             else {
                 ImGui::SetCursorPos(ImVec2(PAD, HEADER_H + 6));
@@ -1019,6 +1108,226 @@ namespace Overlay {
         ImGui::PopStyleColor(2);
     }
 
+    // ── Stats window panel ───────────────────────────────────────────────────
+    // StatsWindowKit counterpart of DrawConfigPanel above — same position,
+    // same singleton-per-mod shape, same bridge pattern (see ModKit.h's
+    // "STATS WINDOW OVERLAY BRIDGE"). Skips drawing if the clicked mod's
+    // config-window bridge is the one that actually registered instead (see
+    // g_openStatsModName's own comment) — the two never legitimately overlap
+    // in this codebase, but this keeps that assumption from silently
+    // double-drawing if it ever changes.
+    inline void DrawStatsPanel() {
+        if (g_openStatsModName.empty()) return;
+        if (ModKitInterop::HasConfigWindow(g_openStatsModName.c_str())) return;
+        if (!ModKitInterop::HasStatsWindow(g_openStatsModName.c_str())) {
+            g_openStatsModName.clear();
+            g_statsPanelDrag.userMoved = false;   // next open re-docks fresh
+            return;
+        }
+        // See DrawConfigPanel's identical call for why this has to happen
+        // here rather than unconditionally at the top of this function.
+        ForceCursorUsable();
+
+        char title[128] = {};
+        ModKitInterop::GetStatsWindowTitle(g_openStatsModName.c_str(), title, sizeof(title));
+        int rowCount = ModKitInterop::GetStatsWindowRowCount(g_openStatsModName.c_str());
+
+        // Fetched upfront (not lazily per-row like before) so a
+        // MODKIT_STATS_COLUMN_BREAK anywhere in the list can decide the
+        // window's WIDTH before Begin() - ImGui needs the size up front,
+        // not something discoverable mid-draw.
+        std::vector<ModKitInterop::ModKitStatsRowView> rows(rowCount);
+        bool hasColumnBreak = false;
+        for (int i = 0; i < rowCount; ++i) {
+            ModKitInterop::GetStatsWindowRow(g_openStatsModName.c_str(), i, &rows[i]);
+            if (rows[i].type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) hasColumnBreak = true;
+        }
+
+        const float STATUS_WIDTH = g_lastStatusPanelWidth;
+        const float PAD = 10, HEADER_H = 30, GUTTER = 16, COL_W = 300;
+        // A mod that emits a column break wants a wide-but-short panel
+        // instead of the default narrow-but-tall one - see this row type's
+        // own comment in ModKit.h. Everything else about the panel (anchor
+        // position, header, close button) stays identical either way.
+        const float WIDTH = hasColumnBreak ? (PAD * 2 + COL_W * 2 + GUTTER) : 320;
+        const float contentW = hasColumnBreak ? COL_W : (WIDTH - PAD * 2);
+        const float col2X = PAD + COL_W + GUTTER;
+
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        // See DrawConfigPanel's identical block for the auto-dock-until-
+        // dragged reasoning.
+        if (!g_statsPanelDrag.userMoved)
+            g_statsPanelDrag.pos = ImVec2(vp->WorkPos.x + 22 + STATUS_WIDTH + 8, vp->WorkPos.y + 56);
+        ImGui::SetNextWindowPos(g_statsPanelDrag.pos, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(WIDTH, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(1.0f);
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMove;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, Colors::BG);
+        ImGui::PushStyleColor(ImGuiCol_Text, Colors::TEXT);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+
+        std::string winId = "##StatsWindow_" + g_openStatsModName;
+        if (ImGui::Begin(winId.c_str(), nullptr, flags)) {
+            bool closeRequested = false;
+            if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Escape))
+                closeRequested = true;
+
+            ImVec2 winPos = ImGui::GetWindowPos();
+            ImDrawList* winDl = ImGui::GetWindowDrawList();
+            winDl->AddRectFilled(winPos, ImVec2(winPos.x + WIDTH, winPos.y + 3), Colors::ACCENT);
+            winDl->AddText(ImVec2(winPos.x + PAD, winPos.y + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
+                Colors::ACCENT, title[0] ? title : g_openStatsModName.c_str());
+
+            bool xHovered = false;
+            {
+                float xW = ImGui::CalcTextSize("x").x + 10;
+                ImVec2 xPos(winPos.x + WIDTH - xW, winPos.y + 4);
+                ImGui::SetCursorScreenPos(xPos);
+                ImGui::PushID("closeStatsBtn");
+                if (ImGui::InvisibleButton("close", ImVec2(xW, HEADER_H - 8)))
+                    closeRequested = true;
+                xHovered = ImGui::IsItemHovered();
+                winDl->AddText(xPos, xHovered ? Colors::TEXT : Colors::DISABLED_TEXT, "x");
+                ImGui::PopID();
+            }
+
+            // See DrawConfigPanel's identical call for the drag mechanics.
+            UpdatePanelDrag(g_statsPanelDrag, winPos, ImVec2(winPos.x + WIDTH, winPos.y + HEADER_H), xHovered);
+
+            if (closeRequested) {
+                ModKitInterop::CloseStatsWindowFromOverlay(g_openStatsModName.c_str());
+                g_openStatsModName.clear();
+                g_statsPanelDrag.userMoved = false;   // next open re-docks fresh
+            }
+            else {
+                const float contentStartY = HEADER_H + 6;
+                ImGui::SetCursorPos(ImVec2(PAD, contentStartY));
+
+                if (rowCount == 0) {
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "No data");
+                }
+
+                // Tracks the taller of the two columns so the window's
+                // auto-fit height (SetNextWindowSize's height=0 above)
+                // covers whichever one actually ends up longer, regardless
+                // of draw order - ImGui's own auto-fit follows the cursor,
+                // and the loop below jumps the cursor back to the top of
+                // column 2 on a break, so without this the auto-fit would
+                // only ever reflect column 2's height.
+                float maxYReached = contentStartY;
+                bool inColumn2 = false;
+
+                for (int i = 0; i < rowCount; ++i) {
+                    const ModKitInterop::ModKitStatsRowView& row = rows[i];
+
+                    if (row.type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) {
+                        maxYReached = (std::max)(maxYReached, ImGui::GetCursorPosY());
+                        inColumn2 = true;
+                        ImGui::SetCursorPos(ImVec2(col2X, contentStartY));
+                        continue;
+                    }
+
+                    const float colX = inColumn2 ? col2X : PAD;
+                    ImGui::SetCursorPosX(colX);
+                    ImGui::PushID(i);
+
+                    switch (row.type) {
+                    case ModKitInterop::MODKIT_STATS_DIVIDER:
+                        ImGui::Dummy(ImVec2(0, 2));
+                        ImGui::SeparatorText(row.label);
+                        break;
+                    case ModKitInterop::MODKIT_STATS_BAR: {
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::SameLine(colX + contentW - 110);
+                        ImGui::TextColored(row.valid
+                            ? ImGui::ColorConvertU32ToFloat4(Colors::TEXT)
+                            : ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "%s", row.valueText);
+                        ImVec4 barCol = ImGui::ColorConvertU32ToFloat4(
+                            IM_COL32((row.barColor) & 0xFF, (row.barColor >> 8) & 0xFF, (row.barColor >> 16) & 0xFF, 255));
+                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barCol);
+                        ImGui::SetCursorPosX(colX);
+                        ImGui::SetNextItemWidth(contentW);
+                        ImGui::ProgressBar(row.valid ? row.barFrac : 0.0f, ImVec2(contentW, 10), "");
+                        ImGui::PopStyleColor();
+                        break;
+                    }
+                    case ModKitInterop::MODKIT_STATS_TEXT:
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::SameLine(colX + contentW * 0.5f);
+                        ImGui::TextColored(row.valid
+                            ? ImGui::ColorConvertU32ToFloat4(Colors::TEXT)
+                            : ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "%s", row.valueText);
+                        break;
+                    case ModKitInterop::MODKIT_STATS_EDIT: {
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::BeginDisabled(!row.enabled);
+                        std::string key = g_openStatsModName + "#" + std::to_string(i);
+                        auto& buf = g_statsEditBuffers[key];
+                        ImGui::SetCursorPosX(colX);
+                        ImGui::SetNextItemWidth(contentW);
+                        bool changed = ImGui::InputText("##e", buf.data(), buf.size());
+                        // Only clobber the box with the live value while the
+                        // user isn't actively typing in it - same reasoning
+                        // as RefreshEditText's focus/dirty guard natively.
+                        if (!ImGui::IsItemActive() && !changed)
+                            strncpy_s(buf.data(), buf.size(), row.valueText, _TRUNCATE);
+                        if (changed)
+                            ModKitInterop::ChangeStatsWindowEdit(g_openStatsModName.c_str(), i, buf.data());
+                        ImGui::EndDisabled();
+                        break;
+                    }
+                    case ModKitInterop::MODKIT_STATS_BUTTON:
+                        ImGui::BeginDisabled(!row.enabled);
+                        if (ImGui::Button(row.label, ImVec2(contentW, 0)))
+                            ModKitInterop::ClickStatsWindowButton(g_openStatsModName.c_str(), i);
+                        ImGui::EndDisabled();
+                        break;
+                    case ModKitInterop::MODKIT_STATS_CHECKBOX: {
+                        bool checked = row.checked;
+                        ImGui::BeginDisabled(!row.enabled);
+                        if (ImGui::Checkbox(row.label, &checked))
+                            ModKitInterop::ToggleStatsWindowCheckbox(g_openStatsModName.c_str(), i);
+                        ImGui::EndDisabled();
+                        break;
+                    }
+                    case ModKitInterop::MODKIT_STATS_DROPDOWN: {
+                        ImGui::TextUnformatted(row.label);
+                        ImGui::BeginDisabled(!row.enabled);
+                        ImGui::SetCursorPosX(colX);
+                        ImGui::SetNextItemWidth(contentW);
+                        if (ImGui::BeginCombo("##d", row.valueText)) {
+                            for (int oi = 0; oi < row.dropdownCount; ++oi) {
+                                char opt[64] = {};
+                                if (!ModKitInterop::GetStatsWindowDropdownOption(g_openStatsModName.c_str(), i, oi, opt, sizeof(opt)))
+                                    continue;
+                                bool selected = strcmp(opt, row.valueText) == 0;
+                                if (ImGui::Selectable(opt, selected))
+                                    ModKitInterop::SelectStatsWindowDropdown(g_openStatsModName.c_str(), i, oi);
+                            }
+                            ImGui::EndCombo();
+                        }
+                        ImGui::EndDisabled();
+                        break;
+                    }
+                    }
+
+                    ImGui::PopID();
+                    ImGui::Dummy(ImVec2(0, 4));
+                }
+
+                maxYReached = (std::max)(maxYReached, ImGui::GetCursorPosY());
+                ImGui::SetCursorPosY(maxYReached);
+                ImGui::Dummy(ImVec2(0, 4));
+            }
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+    }
+
     // Was a magenta "OVERLAY RENDERING OK" marker, unconditional every
     // frame — confirmed rendering works (RE3, repeatedly), removed from
     // the call below. Left defined here, unused, in case a future
@@ -1062,6 +1371,12 @@ namespace Overlay {
 
         if (!g_channel2Enabled && g_statusPanelOpen) CloseStatusPanel();
 
+        // Keep ModKit.dll's persistent overlay-mode flag in sync every frame
+        // (not just on change) - see ModKit_IsOverlayModeActive's own
+        // comment in ModKit.h for why a push-on-change-only design isn't
+        // reliable here.
+        ModKitInterop::SetOverlayModeActive(g_channel2Enabled);
+
         // Apply the deferred cursor-draw-mode flag here - the one place
         // it's ever safe to touch ImGui's io struct (render thread, between
         // NewFrame() and Render()) - see g_wantMouseDrawCursor's own comment.
@@ -1076,19 +1391,63 @@ namespace Overlay {
         }
 
         std::vector<ModRow> rows;
-        if (g_channel2Enabled) rows = ReadModRows();
+        if (g_channel2Enabled) {
+            rows = ReadModRows();
+
+            // A stats/config window opened by something other than a row
+            // click (e.g. a mod's own keyboard hotkey, like CharacterStats's
+            // RCTRL+NUMPAD-DOT) never runs through DrawStatusPanel's click
+            // handler below, which is the only other place these get set -
+            // catch that here once a frame instead, so the panel still
+            // shows up. Only fires while empty: a click always wins
+            // immediately, this is purely a fallback for whatever a click
+            // hasn't already claimed.
+            if (g_openConfigModName.empty()) {
+                for (auto& r : rows) {
+                    if (ModKitInterop::HasConfigWindow(r.modName.c_str())) { g_openConfigModName = r.modName; break; }
+                }
+            }
+            if (g_openStatsModName.empty()) {
+                for (auto& r : rows) {
+                    if (ModKitInterop::HasStatsWindow(r.modName.c_str())) { g_openStatsModName = r.modName; break; }
+                }
+            }
+        }
 
         if (g_channel2Enabled) DiffAndPushToasts(rows);
         DrawToastStack(); // safe even if g_channel2Enabled just went false — Prune() drains the stack
 
         if (g_channel2Enabled && g_statusPanelOpen) DrawDarkBackdrop();
         if (g_channel2Enabled && g_statusPanelOpen) DrawStatusPanel(rows);
-        // Gated the same as the status panel now - a config window hides
-        // (stops drawing) when INSERT closes and reappears in the same
-        // spot when it reopens, rather than staying independently visible.
-        // Nothing about its underlying state (rows, values, which mod)
-        // changes while hidden - see g_openConfigModName's own comment.
-        if (g_channel2Enabled && g_statusPanelOpen) DrawConfigPanel();
+        // Independently visible regardless of the main INSERT panel's own
+        // open/closed state - a mod's own hotkey (CharacterStats's
+        // RCTRL+NUMPAD-DOT) can open its stats window without the main
+        // panel being open at all, mirroring the native Toast-mode hotkey
+        // opening a standalone win32 window with no dependency on
+        // ModsStatusPanel being shown. Each panel already no-ops
+        // immediately if its own g_open*ModName is empty (see the
+        // auto-discovery block above and g_openConfigModName's own
+        // comment), so this is safe to leave ungated beyond
+        // g_channel2Enabled - no config/stats-window mod currently has a
+        // hotkey of its own, but there's no reason to gate this one
+        // differently from DrawStatsPanel below it now that the
+        // click-only assumption behind the old gating no longer holds.
+        if (g_channel2Enabled) DrawConfigPanel();
+        if (g_channel2Enabled) DrawStatsPanel();
+
+        // Counterpart to each Draw*Panel's own ForceCursorUsable() call -
+        // release cursor control the moment NONE of the three overlay
+        // surfaces (status/config/stats) are still visible, regardless of
+        // which one(s) were open a moment ago. Safe/idempotent to call
+        // every frame nothing is open - see RestoreCursor's own early
+        // returns. g_open*ModName reflect this frame's actual outcome by
+        // now, not last frame's - each panel already self-clears its own
+        // when it stops drawing (closed via X/Escape, mode switch, or the
+        // provider simply vanishing), so checking them here rather than
+        // g_statusPanelOpen alone correctly covers a config/stats window
+        // left open on its own after the main panel closes.
+        if (!g_statusPanelOpen && g_openConfigModName.empty() && g_openStatsModName.empty())
+            RestoreCursor();
     }
 
 } // namespace Overlay

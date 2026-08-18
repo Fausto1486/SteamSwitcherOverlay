@@ -16,15 +16,16 @@ It is not a standalone tool. It's designed to be injected by SteamSwitcher itsel
 6. [DX12 Queue Capture](#dx12-queue-capture)
 7. [Data Flow: ModKit → Overlay](#data-flow-modkit--overlay)
 8. [In-Game Config Windows](#in-game-config-windows)
-9. [Session Header, Dim Backdrop, and Logs Button](#session-header-dim-backdrop-and-logs-button)
-10. [Attach Lifecycle](#attach-lifecycle)
-11. [Pipe Protocol](#pipe-protocol)
-12. [Hotkey](#hotkey)
-13. [Logging](#logging)
-14. [Known Limitations](#known-limitations)
-15. [Deployment Layout](#deployment-layout)
-16. [Build Notes](#build-notes)
-17. [Safety Scope](#safety-scope)
+9. [In-Game Stats Windows](#in-game-stats-windows)
+10. [Session Header, Dim Backdrop, and Logs Button](#session-header-dim-backdrop-and-logs-button)
+11. [Attach Lifecycle](#attach-lifecycle)
+12. [Pipe Protocol](#pipe-protocol)
+13. [Hotkey](#hotkey)
+14. [Logging](#logging)
+15. [Known Limitations](#known-limitations)
+16. [Deployment Layout](#deployment-layout)
+17. [Build Notes](#build-notes)
+18. [Safety Scope](#safety-scope)
 
 ---
 
@@ -62,9 +63,9 @@ SteamSwitcher injects this DLL the exact same way it injects `ModKit.dll` — `C
 |---|---|
 | `SteamSwitcherOverlay.cpp` | Entry point. `DllMain`, module pinning, wires the hotkey/pipe callbacks to `PresentHookKit::RequestAttach()` and `Overlay::*`. |
 | `PresentHookKit.h` | All D3D9/D3D11/D3D12 hooking. Installs/uninstalls hooks, drives the attach/render lifecycle, owns the DX12 queue-capture logic. The largest file in the project — see [Hooking Strategy](#hooking-strategy). |
-| `OverlayContent.h` | `DrawOverlay()` — the actual pixels. Builds the per-frame `ModRow` list from `SharedDataReader`, diffs it against the previous frame to push toast notifications, and draws the status panel, toast stack, and (see [In-Game Config Windows](#in-game-config-windows)) a mod's config-window panel via ImGui. |
+| `OverlayContent.h` | `DrawOverlay()` — the actual pixels. Builds the per-frame `ModRow` list from `SharedDataReader`, diffs it against the previous frame to push toast notifications, and draws the status panel, toast stack, a mod's config-window panel (see [In-Game Config Windows](#in-game-config-windows)), and a mod's stats-window panel (see [In-Game Stats Windows](#in-game-stats-windows)) via ImGui. |
 | `SharedDataReader.h` | Read-only access to ModKit's `ModKitSharedData_v1` named shared-memory block. Ported from SteamSwitcher's own `ModSharedStatusReadercs.cs` — same layout, same read philosophy (open fresh every read, no locking, torn reads self-correct on next resync). No `ModKit.dll` build dependency. |
-| `ModKitInterop.h` | Lazy `GetProcAddress`-based access to `ModKit.dll` exports — the original four (`ModKit_HasButton`/`ClickButton`/`IsPoolSearching`/`IsPoolClearing`) plus the full config-window overlay bridge (`ModKit_ClickButtonForOverlay`, `ModKit_HasConfigWindow`, `ModKit_GetConfigWindowTitle`/`RowCount`/`Row`/`DropdownOption`, `ModKit_SetConfigWindowToggle`/`Float`/`Int`/`Dropdown`, `ModKit_CloseConfigWindowFromOverlay`/`CloseAllConfigWindows` — see [In-Game Config Windows](#in-game-config-windows)) — resolved at runtime, re-attempted every call until found, since load order between the two DLLs isn't guaranteed. `ModKitConfigRowView`/`ModKitConfigRowType` are deliberately redefined here (byte-for-byte copy of `ModKit.h`'s versions) rather than included, per this file's no-header-include/no-static-link philosophy. No static link to `ModKit.lib` at all. |
+| `ModKitInterop.h` | Lazy `GetProcAddress`-based access to `ModKit.dll` exports — the original four (`ModKit_HasButton`/`ClickButton`/`IsPoolSearching`/`IsPoolClearing`), the config-window overlay bridge (`ModKit_ClickButtonForOverlay`, `ModKit_HasConfigWindow`, `ModKit_GetConfigWindowTitle`/`RowCount`/`Row`/`DropdownOption`, `ModKit_SetConfigWindowToggle`/`Float`/`Int`/`Dropdown`, `ModKit_CloseConfigWindowFromOverlay`/`CloseAllConfigWindows` — see [In-Game Config Windows](#in-game-config-windows)), and the stats-window overlay bridge (`ModKit_HasStatsWindow`, `ModKit_GetStatsWindowTitle`/`RowCount`/`Row`/`DropdownOption`, `ModKit_ClickStatsWindowButton`, `ModKit_ToggleStatsWindowCheckbox`, `ModKit_ChangeStatsWindowEdit`, `ModKit_SelectStatsWindowDropdown`, `ModKit_CloseStatsWindowFromOverlay`/`CloseAllStatsWindows` — see [In-Game Stats Windows](#in-game-stats-windows)) — resolved at runtime, re-attempted every call until found, since load order between the two DLLs isn't guaranteed. `ModKitConfigRowView`/`ModKitConfigRowType` and `ModKitStatsRowView`/`ModKitStatsRowType` are deliberately redefined here (byte-for-byte copies of `ModKit.h`'s versions) rather than included, per this file's no-header-include/no-static-link philosophy. No static link to `ModKit.lib` at all. |
 | `OverlayPipe.h` | Named-pipe server (`SteamSwitcherOverlayPipe`) — SteamSwitcher connects as client and pushes `SETMODCHANNEL|`/`TOAST|` commands. See [Pipe Protocol](#pipe-protocol). |
 | `HotkeyPoll.h` | Independent `GetAsyncKeyState(VK_INSERT)` poll (50ms) to toggle the status panel. No dependency on `ModKit.dll` being loaded at all. |
 | `Logging.h` / `RemoteLog.h` | `Logging::LogFmt` forwards every line to SteamSwitcher's optional debug-log pipe (`SteamSwitcherOverlayLogPipe`) via a best-effort, no-retry `CreateFileA`/`WriteFile` per call. No local log file. |
@@ -148,6 +149,20 @@ Clicking a clickable row in the status panel doesn't just invoke the mod's butto
 
 ---
 
+## In-Game Stats Windows
+
+The `StatsWindowKit` counterpart of the section above — lets a mod's live-data window (stat bars, editable fields, buttons, dropdowns — e.g. both games' `CharacterStats.cpp`) render inside this overlay via ImGui instead of its native win32 window. See the `ModKit` project's own README, [Stats Window Overlay Bridge](../ModKit/README.md#stats-window-overlay-bridge), for the mod-side registration surface (`StatsWindowKit::OverlayBinding`) and the wire format.
+
+Reuses the exact same row-click mechanism as config windows — `DrawStatusPanel`'s click handler sets both `g_openConfigModName` and `g_openStatsModName` to the clicked mod's name in the same `ClickButtonForOverlay` call, since a mod only ever registers with one of the two bridges. `DrawStatsPanel()` (`OverlayContent.h`) checks `ModKitInterop::HasConfigWindow` first (a genuine collision isn't possible in this codebase — no mod uses both `ModConfigWindow` and `StatsWindowKit` — but this keeps that assumption from silently double-drawing if it ever changes) and otherwise renders exactly like `DrawConfigPanel`: same position (immediately right of the status panel), same header/close-button/Escape handling, same "stops drawing the moment `HasStatsWindow` goes false" behavior.
+
+**Row rendering** switches on `ModKitStatsRowType` per row: `MODKIT_STATS_DIVIDER` → `ImGui::SeparatorText`, `MODKIT_STATS_BAR` → a colored `ImGui::ProgressBar` plus the pre-formatted `"cur / max"` text (color unpacked from `row.barColor`'s `0x00BBGGRR` layout), `MODKIT_STATS_TEXT` → a plain label/value line, `MODKIT_STATS_EDIT` → `ImGui::InputText`, `MODKIT_STATS_BUTTON` → `ImGui::Button`, `MODKIT_STATS_CHECKBOX` → `ImGui::Checkbox`, `MODKIT_STATS_DROPDOWN` → `ImGui::BeginCombo` + `ModKitInterop::GetStatsWindowDropdownOption` per entry, `MODKIT_STATS_COLUMN_BREAK` → not a real row, see below. Writes go back through `ModKitInterop::ClickStatsWindowButton`/`ToggleStatsWindowCheckbox`/`ChangeStatsWindowEdit`/`SelectStatsWindowDropdown`, all addressed by `rowIndex` (stable for the frame — see the ModKit README's own note on `getRowCount`/`getRow` timing).
+
+**Two-column layout.** `DrawStatsPanel` fetches every row into a local vector up front (rather than lazily per-row like `DrawConfigPanel` still does) specifically to check for a `MODKIT_STATS_COLUMN_BREAK` before `ImGui::Begin` — the panel's width has to be decided before then, not discovered mid-draw. A mod with no column break gets the original narrow-but-tall 320px panel; one that includes a break gets a wider two-column layout (two 300px columns plus a gutter) instead, with the loop jumping the cursor to the top of column two on hitting that row and staying there for the rest of the list. Whichever column ends up taller sets the panel's auto-fit height, tracked explicitly across the jump rather than left to whatever ImGui's cursor happens to be sitting on at the end of the loop. See [Stats Window Overlay Bridge](../ModKit/README.md#stats-window-overlay-bridge) for the mod-side `Element::ColumnBreak()`.
+
+**Edit-box buffers** (`g_statsEditBuffers`, keyed by `"modName#rowIndex"`) persist across frames so `ImGui::InputText` has a stable buffer to type into. Each is refreshed from that frame's `row.valueText` (the mod's live game value) only while the box isn't `ImGui::IsItemActive()` — the same focus-guard reasoning as `StatsWindowKit::RefreshEditText` on the native side, just re-implemented here since there's no HWND to ask.
+
+---
+
 ## Session Header, Dim Backdrop, and Logs Button
 
 `DrawStatusPanel` (`OverlayContent.h`) grew a header block above the existing "MODS - click to configure" strip, mirroring SteamSwitcher's own `ModsStatusPanel.cs` (WinForms, Toast mode) feature-for-feature so both modes read as the same product:
@@ -183,7 +198,9 @@ SteamSwitcher connects as client and pushes plain `KEY|value` text to `\\.\pipe\
 | `SETMODCHANNEL\|1` | Enables Channel 2 (mod content) and requests attach. |
 | `SETMODCHANNEL\|0` | Disables Channel 2 — closes the status panel if open, but toast rendering continues (drains naturally as toasts expire). |
 | `TOAST\|<text>` | Pushes a generic, non-mod-related info toast and requests attach. |
-| `CLOSECONFIGWINDOWS` | Closes every open mod config window, native or overlay-drawn alike (calls `ModKitInterop::CloseAllConfigWindows()` — see the ModKit README's [Config Window Overlay Bridge](../ModKit/README.md#config-window-overlay-bridge)). Sent the instant SteamSwitcher's `NotificationMode` dropdown changes, so a config window from the old mode never lingers into the new one — see `ModsPanel.cs`'s `Cmb_notificationMode_Changed`. |
+| `CLOSECONFIGWINDOWS` | Closes every open mod config window and stats window, native or overlay-drawn alike (calls `ModKitInterop::CloseAllConfigWindows()` and `ModKitInterop::CloseAllStatsWindows()` — see the ModKit README's [Config Window Overlay Bridge](../ModKit/README.md#config-window-overlay-bridge) and [Stats Window Overlay Bridge](../ModKit/README.md#stats-window-overlay-bridge)). Sent the instant SteamSwitcher's `NotificationMode` dropdown changes, so a window from the old mode never lingers into the new one — see `ModsPanel.cs`'s `Cmb_notificationMode_Changed`. |
+
+`SETMODCHANNEL` isn't the only place `g_channel2Enabled` matters to ModKit.dll: `DrawOverlay` pushes it there every single frame via `ModKitInterop::SetOverlayModeActive()`, independent of this pipe protocol entirely — see `ModKit_IsOverlayModeActive`'s own comment in the ModKit README for why a mod's keyboard-hotkey handler needs a persistent flag like this rather than the per-click `ModKit_IsOverlayActive()`.
 
 This DLL never writes back over this pipe — logging goes out over the separate `SteamSwitcherOverlayLogPipe` instead (see [Logging](#logging)).
 
