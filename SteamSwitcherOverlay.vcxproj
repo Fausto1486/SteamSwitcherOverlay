@@ -74,6 +74,11 @@
     <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\SteamSwitcherOverlay\</OutDir>
     <IntDir>$(Platform)\$(Configuration)\SteamSwitcherOverlay\</IntDir>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\SteamSwitcherOverlay32\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\SteamSwitcherOverlay32\</IntDir>
+    <TargetName>SteamSwitcherOverlay32</TargetName>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -102,17 +107,23 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;STEAMSWITCHEROVERLAY_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>$(ProjectDir)imgui; $(ProjectDir)imgui\backends</AdditionalIncludeDirectories>
+      <DebugInformationFormat>None</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
+    <PostBuildEvent>
+      <Command>xcopy /Y "$(OutDir)$(TargetName).dll" "D:\Documents\Fausto Switcher tools\SteamSwitcher\Data\Mods32"</Command>
+      <Message>Copy DLL overlay to SteamSwitcher mods32 folder.</Message>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
