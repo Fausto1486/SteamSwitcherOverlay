@@ -30,8 +30,9 @@
 //     Streamline gate (RequestAttach's IsStreamlineLoaded check) restored
 //     to active — do NOT bypass it again without new diagnostic evidence,
 //     not another guess.
-// DX9 remains disabled, untested, unrelated to this push. Still open
-// before DX12/RE3-class games are shipping-ready: an explicit
+// DX9 is now enabled (Install() called from InstallWorkerThreadProc) but
+// still unconfirmed against a real DX9 game — unrelated to this DX12 push.
+// Still open before DX12/RE3-class games are shipping-ready: an explicit
 // fullscreen-transition retest under DX12, and mid-session overlay
 // toggle (INSERT) a few times to rule out a reattach-time regression of
 // the queue-capture fix.
@@ -287,16 +288,17 @@ namespace PresentHookKit {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // DX9 — DISABLED IN PRODUCTION, NOT DELETED. See InstallWorkerThreadProc
-    // near the bottom of this file: DX9::Install() is never called. All the
-    // code below is fully functional and was working logic as of the last
-    // test pass (SEH-wrapped, permanent-abort-flag protected, same as
-    // DX11/DX12) — it was disabled purely because it was never confirmed
-    // firing on a real DX9 game across this whole session, so there's no
-    // positive evidence it's actually safe in practice, only that it never
-    // got a chance to prove itself either way. To re-enable: uncomment/
-    // re-add the DX9::Install() call in InstallWorkerThreadProc, then
-    // actually test against a real DX9 game before trusting it again.
+    // DX9 — RE-ENABLED, NOT YET CONFIRMED. Install() is now called from
+    // InstallWorkerThreadProc, same as DX11/DX12. The code below is
+    // unchanged from the last test pass (SEH-wrapped, permanent-abort-flag
+    // protected, same as DX11/DX12) but has never actually been confirmed
+    // firing on a real DX9 game — there is still no positive evidence this
+    // path works in practice, only that it's now getting a chance to prove
+    // itself. Treat the first real DX9 game tested against this build as
+    // the actual verification step, not this re-enable itself. If it faults
+    // or misbehaves, the fastest revert is commenting the DX9::Install()
+    // call back out in InstallWorkerThreadProc rather than touching this
+    // namespace.
     // ═══════════════════════════════════════════════════════════════════════
     namespace DX9 {
         typedef HRESULT(STDMETHODCALLTYPE* EndScene_t)(IDirect3DDevice9*);
@@ -1867,16 +1869,18 @@ namespace PresentHookKit {
         // either way — it's always needed for queue capture, and the native
         // path additionally reuses it as the real submission trampoline.
         //
-        // DX9 remains disabled — untested, unrelated to this DX12 work.
+        // DX9 is now installed too — see the DX9 namespace's own header
+        // comment for its current confirmation status.
         //
         // DX11 remains installed unconditionally — still the only
         // confirmed-stable backend and DX12 games rely on DX11's Present
         // hook as their shared frame-boundary signal (see this file's own
         // header comment).
         // ═══════════════════════════════════════════════════════════════
+        DX9::Install();
         if (isDX11) DX11::Install();
         if (isDX12) DX12::Install();
-        Logging::LogFmt("[PresentHookKit] Module detection: d3d12=%d d3d11=%d — DX11 always installed; DX12 re-enabled (native ImGui_ImplDX12 path, or D3D11On12 if Streamline is present — decided per-attach); DX9 still disabled.",
+        Logging::LogFmt("[PresentHookKit] Module detection: d3d12=%d d3d11=%d — DX9 installed unconditionally (no-ops if absent); DX11 always installed; DX12 re-enabled (native ImGui_ImplDX12 path, or D3D11On12 if Streamline is present — decided per-attach).",
             (int)isDX12, (int)isDX11);
     }
 
