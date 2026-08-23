@@ -88,10 +88,12 @@
 #include <dxgi1_4.h>
 #include <vector>
 #include <chrono>
+#include <string>
 #include "./MinHook/minhook.h"
 #include "Logging.h"
 #include "HotkeyPoll.h"
 #include "OverlayContent.h"
+#include "OverlayCommandPipe.h"
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -153,6 +155,11 @@ namespace PresentHookKit {
     // reason left to refuse attaching outright.
     inline bool g_refuseAttachOnStreamlineForTesting = false;
 
+    // Forward-declared — defined below alongside the rest of the backend
+    // confirmation/watchdog machinery, but RequestAttach (right below)
+    // needs to call it before that point in the file.
+    inline void StartBackendWatchdog();
+
     inline void RequestAttach() {
         // Idempotent — g_attachRequested never resets once true (nothing
         // in this file ever sets it back to false), so every call after
@@ -169,10 +176,97 @@ namespace PresentHookKit {
             Logging::LogFmt("[PresentHookKit] NVIDIA Streamline (sl.interposer.dll) detected — attaching anyway. DX12 will select its D3D11On12 render path instead of the native ImGui_ImplDX12 path once it attaches (see DX12::LazyInit).");
         }
         g_attachRequested = true;
+        StartBackendWatchdog();
+    }
+
+    // ── Backend confirmation / no-backend watchdog ─────────────────────────
+    // See g_confirmedGameHwnd's own comment above for why "a backend's
+    // LazyInit succeeded" isn't by itself proof anything real rendered —
+    // it also has to have attached to the confirmed real game window, not
+    // an incidental device. g_backendConfirmed is only ever set from
+    // OnBackendConfirmed below, which every backend's LazyInit calls right
+    // after its own ClaimHwndAndSubclass call succeeds — and that call
+    // already refuses a non-matching HWND, so reaching OnBackendConfirmed
+    // at all is already proof of a real attach.
+    inline volatile bool g_backendConfirmed = false;
+    inline volatile bool g_noBackendSent = false;
+
+    // Called once by whichever backend's LazyInit is first to successfully
+    // ClaimHwndAndSubclass onto the confirmed real game window. Idempotent
+    // (guarded by g_backendConfirmed) since more than one backend could in
+    // principle race to call this, though only one ever actually attaches
+    // in practice (DX11's Present hook wins the shared DXGI signal before
+    // DX12 even tries — see this file's own top-of-file architecture note
+    // — and DX9 is a fully separate hook that never contends with either).
+    inline void OnBackendConfirmed(const char* backendName) {
+        if (g_backendConfirmed) return;
+        g_backendConfirmed = true;
+        Logging::LogFmt("[PresentHookKit] Backend confirmed: %s (attached to the real game window).", backendName);
+        OverlayCommandPipe::Send(std::string("BACKENDOK|") + backendName);
+    }
+
+    // Timeout generous enough to cover a slow-loading game and DX12's own
+    // Streamline queue-correlation window (~90 frames, see DX12 Queue
+    // Capture's own comment — well under a second at any real framerate,
+    // but this errs on the side of not false-alarming a game that's just
+    // taking a while), without leaving SteamSwitcher waiting so long the
+    // player assumes something hung. If this ever needs tuning per-game,
+    // that's a sign this constant should become configurable — not yet
+    // justified by anything actually observed.
+    constexpr int kNoBackendTimeoutSeconds = 10;
+
+    inline DWORD WINAPI BackendWatchdogThreadProc(LPVOID) {
+        for (int i = 0; i < kNoBackendTimeoutSeconds * 10; ++i) {
+            if (g_backendConfirmed) return 0; // confirmed elsewhere - nothing to do
+            Sleep(100);
+        }
+        if (!g_backendConfirmed && !g_noBackendSent) {
+            g_noBackendSent = true;
+            Logging::LogFmt("[PresentHookKit] No backend confirmed %d seconds after attach was requested - sending NOBACKEND.", kNoBackendTimeoutSeconds);
+            OverlayCommandPipe::Send("NOBACKEND");
+        }
+        return 0;
+    }
+
+    inline void StartBackendWatchdog() {
+        HANDLE h = CreateThread(nullptr, 0, BackendWatchdogThreadProc, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
     }
     inline HWND g_gameHwnd = nullptr;
     inline WNDPROC g_originalWndProc = nullptr;
     inline bool g_minHookInitialized = false;
+
+    // The real game window, as confirmed by SteamSwitcher itself
+    // (WaitForGameWindowAsync's own splash-to-main-window detection on the
+    // C# side, sent here via OverlayPipe's GAMEHWND message — see
+    // SetConfirmedGameHwnd below). Nullptr until that message arrives.
+    //
+    // Without this, ClaimHwndAndSubclass accepts ANY window handle a
+    // hooked Present/EndScene call happens to carry — including one from
+    // Steam's own overlay creating its own dummy D3D11/D3D12 device in
+    // this same process for its own rendering (confirmed happening on a
+    // real DX9 game — see the BO2 test log's DX12 OnSwapChainCreationQueueSeen
+    // / DX11 "installed" lines alongside the real DX9 EndScene attach).
+    // A hook firing and LazyInit succeeding against THAT window would
+    // look identical to a real, working attach from this file's own
+    // perspective — ImGui renders somewhere, g_imguiInit goes true, and
+    // BackendConfirmed below would wrongly report success even though
+    // nothing the player can see is happening. Once this is set, every
+    // ClaimHwndAndSubclass call is checked against it and refused if it
+    // doesn't match, so only an attach onto the real game window can ever
+    // count as "confirmed."
+    inline HWND g_confirmedGameHwnd = nullptr;
+    inline void SetConfirmedGameHwnd(HWND hwnd) {
+        g_confirmedGameHwnd = hwnd;
+        char titleBuf[128] = {};
+        GetWindowTextA(hwnd, titleBuf, sizeof(titleBuf));
+        char classBuf[128] = {};
+        GetClassNameA(hwnd, classBuf, sizeof(classBuf));
+        RECT r = {};
+        GetWindowRect(hwnd, &r);
+        Logging::LogFmt("[PresentHookKit] Confirmed real game HWND: 0x%p (title=\"%s\" class=\"%s\" size=%ldx%ld)",
+            hwnd, titleBuf, classBuf, r.right - r.left, r.bottom - r.top);
+    }
 
     inline bool EnsureMinHookInitialized() {
         if (g_minHookInitialized) return true;
@@ -224,6 +318,70 @@ namespace PresentHookKit {
     inline bool ClaimHwndAndSubclassUnsafe(HWND hwnd) {
         if (!hwnd || !IsWindow(hwnd)) return false;
         if (hwnd == g_gameHwnd) return true; // already attached to this exact window
+
+        // Require g_confirmedGameHwnd before ANY attach can succeed, full
+        // stop — not "prefer it when available, race otherwise." A "first
+        // successful attach wins" fallback was tried here first and is
+        // exactly backwards: whichever backend's Present/EndScene happens
+        // to fire first (which can easily be an incidental device — Steam's
+        // own overlay rendering internally in the same process, confirmed
+        // happening on a real DX12 game) would permanently lock out the
+        // ACTUAL backend the game needs for the rest of the session, with
+        // no way to correct it. A DX12 game must end up on the DX12 hook,
+        // not on whichever hook happened to win a race.
+        //
+        // This is safe to require unconditionally because GAMEHWND is now
+        // sent immediately alongside SETMODCHANNEL|1 (see ModInjector.cs's
+        // InjectAsync/InjectOverlayIntoRunningGame), not deferred to a
+        // later point — so in practice this only costs a few frames' delay
+        // (Present/EndScene fires every frame; the first one or two calls
+        // simply retry until GAMEHWND lands, invisible at any real
+        // framerate), not a meaningful attach delay. If GAMEHWND genuinely
+        // never arrives (pipe failure, an old SteamSwitcher build with no
+        // GAMEHWND support at all), every attach attempt correctly keeps
+        // refusing forever, the backend watchdog's own NOBACKEND fires at
+        // its normal timeout, and SteamSwitcher falls back to Toast — the
+        // correct outcome for "we genuinely can't tell which backend is
+        // real," not a silent wrong guess.
+        if (!g_confirmedGameHwnd) return false;
+        // Exact match OR a descendant of it - not exact match only. Some
+        // engines create the D3D9 device against an inner child render
+        // window while the outer titled/sized frame window (what
+        // GetVisibleTitleWindowHwnd finds via Win32-level enumeration —
+        // ModInjector.cs) is a DIFFERENT HWND. Confirmed real: a device
+        // whose own cp.hFocusWindow never matched g_confirmedGameHwnd by
+        // equality, on a game that's genuinely running and rendering (no
+        // other candidate device ever called EndScene at all - ruling out
+        // "it's an incidental device we correctly rejected"). GA_ROOT
+        // walks up to the top-level owning window regardless of nesting
+        // depth, so this still correctly rejects a genuinely unrelated
+        // window (e.g. Steam's own overlay, which isn't a descendant of
+        // the game's own window hierarchy at all) while accepting a
+        // legitimate child render surface.
+        bool isDescendant = hwnd != g_confirmedGameHwnd && GetAncestor(hwnd, GA_ROOT) == g_confirmedGameHwnd;
+        if (hwnd != g_confirmedGameHwnd && !isDescendant) {
+            // Diagnostic dump, not a fix - two rejected windows across two
+            // sessions (0x000A123A, then 0x00111218) neither matched nor
+            // were descendants, and neither repeated, so guessing a third
+            // heuristic blind isn't warranted yet. Title/size/class-name
+            // tell us whether this is a tiny helper window (matches the
+            // shape of an incidental device, e.g. this file's own
+            // CreateDummyWindow - 16x16, WS_POPUP) or something
+            // game-window-sized under a genuinely different top-level HWND
+            // than what GetVisibleTitleWindowHwnd found.
+            char titleBuf[128] = {};
+            GetWindowTextA(hwnd, titleBuf, sizeof(titleBuf));
+            char classBuf[128] = {};
+            GetClassNameA(hwnd, classBuf, sizeof(classBuf));
+            RECT r = {};
+            GetWindowRect(hwnd, &r);
+            Logging::LogFmt("[PresentHookKit] ClaimHwndAndSubclass: refusing hwnd=0x%p (title=\"%s\" class=\"%s\" size=%ldx%ld) — confirmed game window is 0x%p (not equal, not a descendant). Likely an incidental device (e.g. Steam's own overlay) firing our hook, not the real game.",
+                hwnd, titleBuf, classBuf, r.right - r.left, r.bottom - r.top, g_confirmedGameHwnd);
+            return false;
+        }
+        if (isDescendant) {
+            Logging::LogFmt("[PresentHookKit] ClaimHwndAndSubclass: hwnd=0x%p is a child of confirmed game window 0x%p - accepting as the real game's render surface.", hwnd, g_confirmedGameHwnd);
+        }
 
         // Logged only, NOT a reason to abort — tried aborting on this
         // condition, then found RE3 hits it too and never crashes,
@@ -307,11 +465,46 @@ namespace PresentHookKit {
         inline bool g_imguiInit = false;
         inline bool g_deviceLost = false;
         inline bool g_renderDisabledAfterFault = false;
-        inline bool g_attachPermanentlyAborted = false; // set once ClaimHwndAndSubclass refuses — without this, LazyInit retried the ENTIRE init sequence every frame forever, 60x/sec of real device/ImGui work, on the same guaranteed-to-fail path
+        // g_attachPermanentlyAborted is for genuinely process-wide, retrying-
+        // won't-help failures (ImGui backend init failing, no focus window
+        // at all) - NOT for a ClaimHwndAndSubclass refusal, which only means
+        // THIS SPECIFIC device's window didn't match. Multiple IDirect3DDevice9
+        // instances can legitimately coexist in one process (confirmed real:
+        // Steam's own incidental D3D9 usage AND the game's actual device, via
+        // a D3D8-to-D3D9 wrapper, both calling the same hooked EndScene) - a
+        // wrong device rejecting first must not block a later, correct
+        // device's own EndScene calls from ever getting a chance. See
+        // g_lastRejectedDevice below for the actual per-device fix.
+        inline bool g_attachPermanentlyAborted = false;
+
+        // Tracks the single most recently HWND-rejected device, so repeat
+        // calls from THAT SAME device (the common case - an incidental
+        // device calls EndScene every frame, same as any real one) skip
+        // straight past without re-running the whole init sequence 60x/sec
+        // on a call already known to fail. A call from any OTHER device
+        // still gets a fresh attempt - that's what actually lets the
+        // correct device succeed after a wrong one was already rejected.
+        inline IDirect3DDevice9* g_lastRejectedDevice = nullptr;
 
         inline void LazyInit(IDirect3DDevice9* device) {
             if (g_imguiInit || g_attachPermanentlyAborted) return;
+            if (device == g_lastRejectedDevice) return; // already known-wrong, don't reinit every frame for it
             if (!g_attachRequested) return; // delayed attach — see g_attachRequested's own comment
+            // Gate here, before ANY device/ImGui backend work starts below
+            // - not down at the ClaimHwndAndSubclass call after
+            // ImGui_ImplWin32_Init/ImGui_ImplDX9_Init have already fully
+            // succeeded. g_imguiInit stays false while waiting, so without
+            // this early gate, every single frame between RequestAttach and
+            // GAMEHWND arriving would re-run this entire init sequence from
+            // scratch without ever tearing down the previous attempt - a
+            // real resource leak and backend double-init (ImGui's own
+            // backends aren't designed to be Init()'d twice without an
+            // intervening Shutdown()). Bailing out here costs nothing more
+            // than the two null checks already above, every frame, until
+            // GAMEHWND lands - which per ModInjector.cs now happens
+            // essentially immediately, so this is a handful of frames at
+            // most, not a real delay.
+            if (!g_confirmedGameHwnd) return;
             D3DDEVICE_CREATION_PARAMETERS cp = {};
             if (FAILED(device->GetCreationParameters(&cp)) || !cp.hFocusWindow) {
                 Logging::LogFmt("[PresentHookKit] DX9 LazyInit: GetCreationParameters failed or no hFocusWindow — aborting permanently, not retrying every frame.");
@@ -334,14 +527,15 @@ namespace PresentHookKit {
             }
 
             if (!ClaimHwndAndSubclass(cp.hFocusWindow)) {
-                Logging::LogFmt("[PresentHookKit] DX9 attach aborted — ClaimHwndAndSubclass refused. Not retrying this session.");
-                g_attachPermanentlyAborted = true;
+                Logging::LogFmt("[PresentHookKit] DX9 attach refused for this device (0x%p) — likely an incidental device, not the real game. Not permanently aborting - a different device's EndScene may still succeed.", device);
+                g_lastRejectedDevice = device;
                 ImGui_ImplDX9_Shutdown();
                 ImGui_ImplWin32_Shutdown(); g_win32BackendActive = false;
                 return;
             }
             g_imguiInit = true;
             Logging::LogFmt("[PresentHookKit] Overlay attached via Direct3D9 EndScene.");
+            OnBackendConfirmed("DX9");
         }
 
         inline bool TryLazyInit(IDirect3DDevice9* device) {
@@ -406,7 +600,28 @@ namespace PresentHookKit {
                 pp.hDeviceWindow = dummyWnd;
 
                 IDirect3DDevice9* dummyDevice = nullptr;
-                HRESULT hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWnd,
+                // D3DDEVTYPE_NULLREF, not D3DDEVTYPE_HAL - this dummy
+                // device only exists to steal EndScene's vtable address for
+                // hooking, never to actually render anything, so it
+                // doesn't need real hardware/display resources. HAL
+                // devices contend for exclusive-fullscreen access on some
+                // GPU drivers - confirmed real on a game whose own D3D9
+                // device (via a D3D8-to-D3D9 wrapper) was already active
+                // in exclusive fullscreen by the time this runs (injection
+                // always happens after the game's own device already
+                // exists - see this file's RequestAttach timing), causing
+                // this second HAL device creation to fail outright, every
+                // time, logging the misleading "game likely doesn't use
+                // it" message even though the game demonstrably does.
+                // NULLREF needs no display/GPU resources at all, so it
+                // can't contend with anything - and since EndScene's
+                // vtable address comes from the same d3d9.dll code
+                // regardless of which device type created it (the whole
+                // hook technique already depends on this being true, since
+                // it hooks a dummy device's EndScene to catch calls on the
+                // GAME's separate, real device), device type shouldn't
+                // affect which address gets hooked.
+                HRESULT hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, dummyWnd,
                     D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES, &pp, &dummyDevice);
                 if (SUCCEEDED(hr) && dummyDevice) {
                     void** vtable = *reinterpret_cast<void***>(dummyDevice);
@@ -422,7 +637,7 @@ namespace PresentHookKit {
                 d3d9->Release();
             }
             DestroyWindow(dummyWnd);
-            Logging::LogFmt(ok ? "[PresentHookKit] DX9 installed." : "[PresentHookKit] DX9 not installed (game likely doesn't use it).");
+            Logging::LogFmt(ok ? "[PresentHookKit] DX9 installed." : "[PresentHookKit] DX9 not installed (game may not use it, or dummy device creation failed for another reason - see this function's own comments).");
             return ok;
         }
 
@@ -498,7 +713,17 @@ namespace PresentHookKit {
         inline bool g_installed = false;
         inline bool g_imguiInit = false;
         inline bool g_renderDisabledAfterFault = false;
-        inline bool g_attachPermanentlyAborted = false; // set once ClaimHwndAndSubclass refuses — see DX9's identical flag for why this matters
+        // See DX9's identical flag/comment for the full reasoning - a
+        // ClaimHwndAndSubclass refusal means THIS device/swapchain was
+        // wrong, not that DX11 can never work in this process. Steam's own
+        // incidental DX11 usage and a game's real DX11 device both exist
+        // in the same process and both call the same hooked Present.
+        inline bool g_attachPermanentlyAborted = false;
+
+        // Same per-instance tracking as DX9's g_lastRejectedDevice, keyed
+        // on swapChain since that's what's available cheapest at the top
+        // of LazyInitUnsafe, before device is even obtained.
+        inline IDXGISwapChain* g_lastRejectedSwapChain = nullptr;
 
         // Forward declaration — defined later (near PatchIfNew/Install),
         // but called from LazyInit, which appears earlier in this
@@ -601,7 +826,19 @@ namespace PresentHookKit {
         // nothing visible, which matches exactly what testing found.
         inline bool LazyInitUnsafe(IDXGISwapChain* swapChain) {
             if (g_attachPermanentlyAborted) return false;
+            if (swapChain == g_lastRejectedSwapChain) return g_imguiInit; // already known-wrong, don't reinit every frame for it
             if (!g_attachRequested) return g_imguiInit; // delayed attach — see g_attachRequested's own comment; also avoids permanently latching g_confirmedNotD3D11 before we've even tried
+            // Same reasoning as DX9::LazyInit's own comment on this gate -
+            // bail before touching the device at all while GAMEHWND is
+            // still pending, instead of running the whole
+            // GetDevice/ImGui_ImplWin32_Init/ImGui_ImplDX11_Init sequence
+            // every frame and only discovering at the very end (after
+            // g_device is already aliased and ImGui backends already
+            // initialized) that we're not ready yet. Once attached,
+            // g_confirmedGameHwnd is already guaranteed set (attachment
+            // can't happen without it), so this never interferes with the
+            // ongoing per-frame re-check-the-window path below.
+            if (!g_confirmedGameHwnd) return g_imguiInit;
             ID3D11Device* device = nullptr;
             if (FAILED(swapChain->GetDevice(IID_PPV_ARGS(&device))) || !device) {
                 // Only a PERMANENT "not D3D11" signal if we've never
@@ -654,8 +891,8 @@ namespace PresentHookKit {
             CreateRenderTarget(swapChain);
 
             if (!ClaimHwndAndSubclass(desc.OutputWindow)) {
-                Logging::LogFmt("[PresentHookKit] DX11 attach aborted — ClaimHwndAndSubclass refused. Not retrying this session.");
-                g_attachPermanentlyAborted = true;
+                Logging::LogFmt("[PresentHookKit] DX11 attach refused for this swapchain (0x%p) — likely an incidental device, not the real game. Not permanently aborting - a different swapchain's Present may still succeed.", swapChain);
+                g_lastRejectedSwapChain = swapChain;
                 if (g_mainRTV) { g_mainRTV->Release(); g_mainRTV = nullptr; }
                 ImGui_ImplDX11_Shutdown();
                 ImGui_ImplWin32_Shutdown(); g_win32BackendActive = false;
@@ -665,6 +902,7 @@ namespace PresentHookKit {
             }
             g_attachedWindow = desc.OutputWindow;
             g_imguiInit = true;
+            OnBackendConfirmed("DX11");
             EnsureResizeHook(*reinterpret_cast<void***>(swapChain));
             swapChain->GetFullscreenState(&g_lastKnownWindowed, nullptr);
             Logging::LogFmt("[PresentHookKit] Overlay attached via DXGI Present (D3D11).");
@@ -1005,7 +1243,11 @@ namespace PresentHookKit {
 
         inline bool g_imguiInit = false;
         inline bool g_renderDisabledAfterFault = false;
-        inline bool g_attachPermanentlyAborted = false; // set once ClaimHwndAndSubclass refuses — see DX9's identical flag.
+        // See DX9's identical flag/comment for the full reasoning - a
+        // ClaimHwndAndSubclass refusal means THIS swapchain was wrong, not
+        // that DX12 can never work in this process.
+        inline bool g_attachPermanentlyAborted = false;
+        inline IDXGISwapChain* g_lastRejectedSwapChain = nullptr; // same per-instance tracking as DX9/DX11's own
         inline ID3D12Device* g_device = nullptr; // borrowed from the swapchain, never Release()'d beyond our own AddRef
 
         // Decided ONCE per attach, in LazyInit — never changes mid-session.
@@ -1209,6 +1451,14 @@ namespace PresentHookKit {
 
         inline void LazyInit(IDXGISwapChain* swapChain) {
             if (g_imguiInit || g_attachPermanentlyAborted) return;
+            if (swapChain == g_lastRejectedSwapChain) return; // already known-wrong, don't reinit every frame for it
+            // Same reasoning as DX9/DX11's own LazyInit gates - bail before
+            // touching the device, queue capture, or Streamline path at
+            // all while GAMEHWND is still pending. DX12's own init
+            // sequence is the most expensive of the three (D3D11On12
+            // device creation, descriptor heaps), so this matters even
+            // more here than for DX9/DX11.
+            if (!g_confirmedGameHwnd) return;
             if (!g_capturedQueue) {
                 static bool loggedOnce = false;
                 if (!loggedOnce) { Logging::LogFmt("[PresentHookKit] DX12 LazyInit: no command queue captured yet."); loggedOnce = true; }
@@ -1377,12 +1627,13 @@ namespace PresentHookKit {
             }
 
             if (!ClaimHwndAndSubclass(desc.OutputWindow)) {
-                Logging::LogFmt("[PresentHookKit] DX12 attach aborted — ClaimHwndAndSubclass refused. Not retrying this session.");
-                g_attachPermanentlyAborted = true;
-                Uninstall(); // full teardown — heaps/command list/fence (native) or wrapped resources/D3D11On12 device (Streamline), backbuffers, device, ImGui backends
+                Logging::LogFmt("[PresentHookKit] DX12 attach refused for this swapchain (0x%p) — likely an incidental device, not the real game. Not permanently aborting - a different swapchain's Present may still succeed.", swapChain);
+                g_lastRejectedSwapChain = swapChain;
+                Uninstall(); // full teardown — heaps/command list/fence (native) or wrapped resources/D3D11On12 device (Streamline), backbuffers, device, ImGui backends. Does NOT touch g_capturedQueue or the ExecuteCommandLists hook - queue capture keeps working for whatever swapchain comes next.
                 return;
             }
             g_imguiInit = true;
+            OnBackendConfirmed("DX12");
             DX11::EnsureResizeHook(*reinterpret_cast<void***>(swapChain));
             Logging::LogFmt("[PresentHookKit] Overlay attached via D3D12 (%s render path + DX11-Present frame signal).",
                 g_usingD3D11On12 ? "D3D11On12, Streamline detected" : "native ImGui_ImplDX12");

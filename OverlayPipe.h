@@ -38,6 +38,22 @@
 //                                         happens to contain '|' doesn't
 //                                         corrupt the fields after it — this
 //                                         is not escaped on the sending side.
+//   GAMEHWND|<value>                    — the real game window handle, as
+//                                         resolved by SteamSwitcher's own
+//                                         WaitForGameWindowAsync before
+//                                         injection. Lets PresentHookKit.h
+//                                         refuse to attach to anything else
+//                                         (e.g. an incidental device Steam's
+//                                         own overlay creates in-process for
+//                                         its own rendering) — see
+//                                         PresentHookKit.h's own
+//                                         g_confirmedGameHwnd comment. <value>
+//                                         is the HWND printed as an unsigned
+//                                         64-bit decimal integer (portable
+//                                         across 32/64-bit without needing a
+//                                         pointer-width-specific format).
+//                                         Sent once, right alongside
+//                                         SETMODCHANNEL|1/GAMEINFO.
 //
 // Extend the dispatch table below as real Channel-1 use cases emerge —
 // don't over-design placeholder message types now, per the blueprint.
@@ -57,6 +73,7 @@ namespace OverlayPipe {
     inline void (*g_onToast)(const std::string& text) = nullptr;
     inline void (*g_onCloseConfigWindows)() = nullptr;
     inline void (*g_onGameInfo)(const std::string& gameName, int64_t launchEpochMs, const std::string& profileName) = nullptr;
+    inline void (*g_onGameHwnd)(HWND hwnd) = nullptr;
 
     // StartsWith dispatch, one callback per message type — same shape as
     // ModPipeMonitor.cs/CmdPipeThread elsewhere in this codebase, per the
@@ -97,6 +114,15 @@ namespace OverlayPipe {
 
             if (g_onGameInfo) g_onGameInfo(gameName, epochMs, profile);
             Logging::LogFmt("[OverlayPipe] GAMEINFO: %s (profile=%s)", gameName.c_str(), profile.c_str());
+        }
+        else if (msg.rfind("GAMEHWND|", 0) == 0) {
+            std::string val = msg.substr(9);
+            unsigned long long raw = 0;
+            try { raw = std::stoull(val); }
+            catch (...) { raw = 0; } // malformed - treat as "unknown", not a crash
+            HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(raw));
+            if (g_onGameHwnd) g_onGameHwnd(hwnd);
+            Logging::LogFmt("[OverlayPipe] GAMEHWND: 0x%p", hwnd);
         }
         else {
             Logging::LogFmt("[OverlayPipe] Unrecognized message: %s", msg.c_str());
@@ -140,13 +166,15 @@ namespace OverlayPipe {
 
     inline void Start(void (*onSetModChannel)(bool), void (*onToast)(const std::string&),
         void (*onCloseConfigWindows)(),
-        void (*onGameInfo)(const std::string&, int64_t, const std::string&))
+        void (*onGameInfo)(const std::string&, int64_t, const std::string&),
+        void (*onGameHwnd)(HWND))
     {
         if (g_running) return;
         g_onSetModChannel = onSetModChannel;
         g_onToast = onToast;
         g_onCloseConfigWindows = onCloseConfigWindows;
         g_onGameInfo = onGameInfo;
+        g_onGameHwnd = onGameHwnd;
         g_running = true;
         HANDLE h = CreateThread(nullptr, 0, ServerThreadProc, nullptr, 0, nullptr);
         if (h) {

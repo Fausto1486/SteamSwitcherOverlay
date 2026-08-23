@@ -89,6 +89,14 @@ namespace {
         Logging::LogFmt("[SteamSwitcherOverlay] GAMEINFO: %s (profile=%s)", gameName.c_str(), profileName.c_str());
     }
 
+    void OnGameHwnd(HWND hwnd) {
+        // See PresentHookKit.h's own g_confirmedGameHwnd comment for why
+        // this exists at all. No RequestAttach() call needed here either,
+        // same reasoning as OnGameInfo above - always sent alongside
+        // SETMODCHANNEL|1, which already triggers attach.
+        PresentHookKit::SetConfirmedGameHwnd(hwnd);
+    }
+
     DWORD WINAPI StartupWorkerThreadProc(LPVOID) {
         // No PID-guard check here — see this file's own header comment.
         // Under production (SteamSwitcher's own LoadLibraryA), the OS
@@ -102,7 +110,7 @@ namespace {
         // review — see OVERLAY-REDESIGN-RESULT.md.
         Logging::LogFmt("[SteamSwitcherOverlay] Startup worker running, pid=%lu", GetCurrentProcessId());
         HotkeyPoll::Start(&OnHotkeyToggle);
-        OverlayPipe::Start(&OnSetModChannel, &OnToast, &OnCloseConfigWindows, &OnGameInfo);
+        OverlayPipe::Start(&OnSetModChannel, &OnToast, &OnCloseConfigWindows, &OnGameInfo, &OnGameHwnd);
         PresentHookKit::InstallAll();
         return 0;
     }
