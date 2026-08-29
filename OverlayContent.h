@@ -580,6 +580,12 @@ namespace Overlay {
             if (key.compare(0, prefix.size(), prefix) == 0) buf.dirty = false;
     }
 
+    // Last frame's measured content height per stats panel, keyed by
+    // modName - see DrawOneStatsPanel's own comment on why a child region's
+    // height has to be decided BEFORE its content is drawn, and how this
+    // one-frame-stale cache resolves that.
+    inline std::unordered_map<std::string, float> g_statsContentHeight;
+
     // ── Anchor window ────────────────────────────────────────────────────
     // ModConfigWindow.h (the per-mod config window, shared native C++ code)
     // finds where to place itself via FindWindowA(nullptr, "ModStatusPanel")
@@ -1359,180 +1365,210 @@ namespace Overlay {
             }
             else {
                 const float contentStartY = HEADER_H + 6;
-                ImGui::SetCursorPos(ImVec2(PAD, contentStartY));
+                ImGui::SetCursorPos(ImVec2(0, contentStartY));
 
                 if (rowCount == 0) {
+                    ImGui::SetCursorPosX(PAD);
                     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "No data");
                 }
+                else {
+                    // The scrollable region's height has to be decided
+                    // BEFORE this frame's rows are drawn (BeginChild takes
+                    // a size, not something discoverable mid-content the
+                    // way the old unbounded auto-fit was) - so it can't be
+                    // based on what THIS frame's content actually needs.
+                    // Cache last frame's measured height instead (one-
+                    // frame-stale, same convention as g_panelDockCursorY's
+                    // own cascade) and use whichever is smaller of that or
+                    // the remaining space to the bottom of the screen -
+                    // this is what actually caps a mod like an equipment
+                    // editor with a dozen-plus dynamic fields from running
+                    // off the bottom of the display the way the old
+                    // SetNextWindowSize(WIDTH, 0) let it.
+                    ImGuiViewport* vp = ImGui::GetMainViewport();
+                    const float maxContentH = (std::max)(120.0f,
+                        vp->WorkPos.y + vp->WorkSize.y - winPos.y - contentStartY - 40.0f);
+                    float& cachedH = g_statsContentHeight[modName];
+                    if (cachedH <= 0.0f) cachedH = 200.0f;   // first-frame guess, before any real measurement exists
+                    const float childH = (std::min)(cachedH, maxContentH);
 
-                // Tracks the taller of the two columns so the window's
-                // auto-fit height (SetNextWindowSize's height=0 above)
-                // covers whichever one actually ends up longer, regardless
-                // of draw order - ImGui's own auto-fit follows the cursor,
-                // and the loop below jumps the cursor back to the top of
-                // column 2 on a break, so without this the auto-fit would
-                // only ever reflect column 2's height.
-                float maxYReached = contentStartY;
-                bool inColumn2 = false;
+                    ImGui::BeginChild("##statsScroll", ImVec2(0, childH), false,
+                        ImGuiWindowFlags_HorizontalScrollbar);
+                    ImGui::SetCursorPos(ImVec2(PAD, 0));
 
-                for (int i = 0; i < rowCount; ++i) {
-                    const ModKitInterop::ModKitStatsRowView& row = rows[i];
+                    // Tracks the taller of the two columns so the child's
+                    // NEXT-frame height (cachedH, set below) covers
+                    // whichever one actually ends up longer, regardless of
+                    // draw order - ImGui's own cursor follows the last
+                    // thing drawn, and the loop below jumps the cursor
+                    // back to the top of column 2 on a break, so without
+                    // this the measurement would only ever reflect column
+                    // 2's height. 0 here (not contentStartY) since this Y
+                    // is now measured in the child's own local space, not
+                    // the outer window's.
+                    float maxYReached = 0.0f;
+                    bool inColumn2 = false;
 
-                    if (row.type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) {
-                        maxYReached = (std::max)(maxYReached, ImGui::GetCursorPosY());
-                        inColumn2 = true;
-                        ImGui::SetCursorPos(ImVec2(col2X, contentStartY));
-                        continue;
-                    }
+                    for (int i = 0; i < rowCount; ++i) {
+                        const ModKitInterop::ModKitStatsRowView& row = rows[i];
 
-                    const float colX = inColumn2 ? col2X : PAD;
-                    ImGui::SetCursorPosX(colX);
-                    ImGui::PushID(i);
-
-                    switch (row.type) {
-                    case ModKitInterop::MODKIT_STATS_DIVIDER: {
-                        ImGui::Dummy(ImVec2(0, 2));
-                        ImGui::SetCursorPosX(colX);
-                        // Hand-drawn instead of ImGui::SeparatorText, whose
-                        // separator line always runs out to the window's
-                        // own right edge regardless of cursor X - fine for
-                        // a single-column panel, but in two-column mode a
-                        // column-1 divider's line ran straight through
-                        // column 2 (and vice versa), and whichever side
-                        // drew later visually won the overlap. This version
-                        // is explicitly bounded to contentW, matching every
-                        // other widget in this switch, and looks the same
-                        // as before in single-column panels since contentW
-                        // there is just the full usable width anyway.
-                        ImVec2 p0 = ImGui::GetCursorScreenPos();
-                        ImVec2 textSize = ImGui::CalcTextSize(row.label);
-                        float lineH = ImGui::GetTextLineHeight();
-                        float midY = p0.y + lineH * 0.5f;
-                        ImDrawList* dl = ImGui::GetWindowDrawList();
-                        const float leadW = 8.0f, gap = 6.0f;
-                        dl->AddLine(ImVec2(p0.x, midY), ImVec2(p0.x + leadW, midY), Colors::ACCENT, 1.0f);
-                        dl->AddText(ImVec2(p0.x + leadW + gap, p0.y), Colors::TEXT, row.label);
-                        float afterX = p0.x + leadW + gap + textSize.x + gap;
-                        float rightEdge = p0.x + contentW;
-                        if (afterX < rightEdge)
-                            dl->AddLine(ImVec2(afterX, midY), ImVec2(rightEdge, midY), Colors::ACCENT, 1.0f);
-                        ImGui::Dummy(ImVec2(contentW, lineH));
-                        break;
-                    }
-                    case ModKitInterop::MODKIT_STATS_BAR: {
-                        ImGui::TextUnformatted(row.label);
-                        ImGui::SameLine(colX + contentW - 110);
-                        ImGui::TextColored(row.valid
-                            ? ImGui::ColorConvertU32ToFloat4(Colors::TEXT)
-                            : ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "%s", row.valueText);
-                        ImVec4 barCol = ImGui::ColorConvertU32ToFloat4(
-                            IM_COL32((row.barColor) & 0xFF, (row.barColor >> 8) & 0xFF, (row.barColor >> 16) & 0xFF, 255));
-                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barCol);
-                        ImGui::SetCursorPosX(colX);
-                        ImGui::SetNextItemWidth(contentW);
-                        ImGui::ProgressBar(row.valid ? row.barFrac : 0.0f, ImVec2(contentW, 10), "");
-                        ImGui::PopStyleColor();
-                        break;
-                    }
-                    case ModKitInterop::MODKIT_STATS_TEXT: {
-                        ImGui::TextUnformatted(row.label);
-                        ImVec4 col = row.valid
-                            ? ImGui::ColorConvertU32ToFloat4(Colors::TEXT)
-                            : ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT);
-                        float valX = colX + contentW * 0.5f;
-                        ImVec2 valSize = ImGui::CalcTextSize(row.valueText);
-                        if (valX + valSize.x <= colX + contentW) {
-                            // Fits beside the label - keep the compact
-                            // side-by-side layout short values (e.g.
-                            // "Attack: 45") already had.
-                            ImGui::SameLine(valX);
-                            ImGui::TextColored(col, "%s", row.valueText);
+                        if (row.type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) {
+                            maxYReached = (std::max)(maxYReached, ImGui::GetCursorPosY());
+                            inColumn2 = true;
+                            ImGui::SetCursorPos(ImVec2(col2X, 0));
+                            continue;
                         }
-                        else {
-                            // Too long to fit beside the label without
-                            // running past the column's own right edge -
-                            // the window clips there, so it used to just
-                            // get cut off mid-sentence. Wrap it on its own
-                            // line below instead.
+
+                        const float colX = inColumn2 ? col2X : PAD;
+                        ImGui::SetCursorPosX(colX);
+                        ImGui::PushID(i);
+
+                        switch (row.type) {
+                        case ModKitInterop::MODKIT_STATS_DIVIDER: {
+                            ImGui::Dummy(ImVec2(0, 2));
                             ImGui::SetCursorPosX(colX);
-                            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + contentW);
-                            ImGui::TextColored(col, "%s", row.valueText);
-                            ImGui::PopTextWrapPos();
+                            // Hand-drawn instead of ImGui::SeparatorText, whose
+                            // separator line always runs out to the window's
+                            // own right edge regardless of cursor X - fine for
+                            // a single-column panel, but in two-column mode a
+                            // column-1 divider's line ran straight through
+                            // column 2 (and vice versa), and whichever side
+                            // drew later visually won the overlap. This version
+                            // is explicitly bounded to contentW, matching every
+                            // other widget in this switch, and looks the same
+                            // as before in single-column panels since contentW
+                            // there is just the full usable width anyway.
+                            ImVec2 p0 = ImGui::GetCursorScreenPos();
+                            ImVec2 textSize = ImGui::CalcTextSize(row.label);
+                            float lineH = ImGui::GetTextLineHeight();
+                            float midY = p0.y + lineH * 0.5f;
+                            ImDrawList* dl = ImGui::GetWindowDrawList();
+                            const float leadW = 8.0f, gap = 6.0f;
+                            dl->AddLine(ImVec2(p0.x, midY), ImVec2(p0.x + leadW, midY), Colors::ACCENT, 1.0f);
+                            dl->AddText(ImVec2(p0.x + leadW + gap, p0.y), Colors::TEXT, row.label);
+                            float afterX = p0.x + leadW + gap + textSize.x + gap;
+                            float rightEdge = p0.x + contentW;
+                            if (afterX < rightEdge)
+                                dl->AddLine(ImVec2(afterX, midY), ImVec2(rightEdge, midY), Colors::ACCENT, 1.0f);
+                            ImGui::Dummy(ImVec2(contentW, lineH));
+                            break;
                         }
-                        break;
-                    }
-                    case ModKitInterop::MODKIT_STATS_EDIT: {
-                        ImGui::TextUnformatted(row.label);
-                        ImGui::BeginDisabled(!row.enabled);
-                        std::string key = modName + "#" + std::to_string(i);
-                        auto& entry = g_statsEditBuffers[key];
-                        ImGui::SetCursorPosX(colX);
-                        ImGui::SetNextItemWidth(contentW);
-                        bool changed = ImGui::InputText("##e", entry.text.data(), entry.text.size());
-                        if (changed) entry.dirty = true;
-                        // Only clobber the box with the live value while the
-                        // user isn't actively typing in it AND there's no
-                        // unsubmitted edit still pending - see
-                        // g_statsEditBuffers's own comment for why focus
-                        // alone isn't enough here.
-                        if (!ImGui::IsItemActive() && !entry.dirty)
-                            strncpy_s(entry.text.data(), entry.text.size(), row.valueText, _TRUNCATE);
-                        if (changed)
-                            ModKitInterop::ChangeStatsWindowEdit(modName.c_str(), i, entry.text.data());
-                        ImGui::EndDisabled();
-                        break;
-                    }
-                    case ModKitInterop::MODKIT_STATS_BUTTON:
-                        ImGui::BeginDisabled(!row.enabled);
-                        if (ImGui::Button(row.label, ImVec2(contentW, 0))) {
-                            ModKitInterop::ClickStatsWindowButton(modName.c_str(), i);
-                            // Whatever was pending has just been submitted -
-                            // see g_statsEditBuffers's own comment.
-                            ClearStatsEditDirty(modName);
+                        case ModKitInterop::MODKIT_STATS_BAR: {
+                            ImGui::TextUnformatted(row.label);
+                            ImGui::SameLine(colX + contentW - 110);
+                            ImGui::TextColored(row.valid
+                                ? ImGui::ColorConvertU32ToFloat4(Colors::TEXT)
+                                : ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT), "%s", row.valueText);
+                            ImVec4 barCol = ImGui::ColorConvertU32ToFloat4(
+                                IM_COL32((row.barColor) & 0xFF, (row.barColor >> 8) & 0xFF, (row.barColor >> 16) & 0xFF, 255));
+                            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barCol);
+                            ImGui::SetCursorPosX(colX);
+                            ImGui::SetNextItemWidth(contentW);
+                            ImGui::ProgressBar(row.valid ? row.barFrac : 0.0f, ImVec2(contentW, 10), "");
+                            ImGui::PopStyleColor();
+                            break;
                         }
-                        ImGui::EndDisabled();
-                        break;
-                    case ModKitInterop::MODKIT_STATS_CHECKBOX: {
-                        bool checked = row.checked;
-                        ImGui::BeginDisabled(!row.enabled);
-                        if (ImGui::Checkbox(row.label, &checked))
-                            ModKitInterop::ToggleStatsWindowCheckbox(modName.c_str(), i);
-                        ImGui::EndDisabled();
-                        break;
-                    }
-                    case ModKitInterop::MODKIT_STATS_DROPDOWN: {
-                        ImGui::TextUnformatted(row.label);
-                        ImGui::BeginDisabled(!row.enabled);
-                        ImGui::SetCursorPosX(colX);
-                        ImGui::SetNextItemWidth(contentW);
-                        if (ImGui::BeginCombo("##d", row.valueText)) {
-                            for (int oi = 0; oi < row.dropdownCount; ++oi) {
-                                char opt[64] = {};
-                                if (!ModKitInterop::GetStatsWindowDropdownOption(modName.c_str(), i, oi, opt, sizeof(opt)))
-                                    continue;
-                                bool selected = strcmp(opt, row.valueText) == 0;
-                                if (ImGui::Selectable(opt, selected)) {
-                                    ModKitInterop::SelectStatsWindowDropdown(modName.c_str(), i, oi);
-                                    // A slot switch makes whatever was
-                                    // pending for the OLD slot moot - see
-                                    // g_statsEditBuffers's own comment.
-                                    ClearStatsEditDirty(modName);
-                                }
+                        case ModKitInterop::MODKIT_STATS_TEXT: {
+                            ImGui::TextUnformatted(row.label);
+                            ImVec4 col = row.valid
+                                ? ImGui::ColorConvertU32ToFloat4(Colors::TEXT)
+                                : ImGui::ColorConvertU32ToFloat4(Colors::DISABLED_TEXT);
+                            float valX = colX + contentW * 0.5f;
+                            ImVec2 valSize = ImGui::CalcTextSize(row.valueText);
+                            if (valX + valSize.x <= colX + contentW) {
+                                // Fits beside the label - keep the compact
+                                // side-by-side layout short values (e.g.
+                                // "Attack: 45") already had.
+                                ImGui::SameLine(valX);
+                                ImGui::TextColored(col, "%s", row.valueText);
                             }
-                            ImGui::EndCombo();
+                            else {
+                                // Too long to fit beside the label without
+                                // running past the column's own right edge -
+                                // the window clips there, so it used to just
+                                // get cut off mid-sentence. Wrap it on its own
+                                // line below instead.
+                                ImGui::SetCursorPosX(colX);
+                                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + contentW);
+                                ImGui::TextColored(col, "%s", row.valueText);
+                                ImGui::PopTextWrapPos();
+                            }
+                            break;
                         }
-                        ImGui::EndDisabled();
-                        break;
-                    }
+                        case ModKitInterop::MODKIT_STATS_EDIT: {
+                            ImGui::TextUnformatted(row.label);
+                            ImGui::BeginDisabled(!row.enabled);
+                            std::string key = modName + "#" + std::to_string(i);
+                            auto& entry = g_statsEditBuffers[key];
+                            ImGui::SetCursorPosX(colX);
+                            ImGui::SetNextItemWidth(contentW);
+                            bool changed = ImGui::InputText("##e", entry.text.data(), entry.text.size());
+                            if (changed) entry.dirty = true;
+                            // Only clobber the box with the live value while the
+                            // user isn't actively typing in it AND there's no
+                            // unsubmitted edit still pending - see
+                            // g_statsEditBuffers's own comment for why focus
+                            // alone isn't enough here.
+                            if (!ImGui::IsItemActive() && !entry.dirty)
+                                strncpy_s(entry.text.data(), entry.text.size(), row.valueText, _TRUNCATE);
+                            if (changed)
+                                ModKitInterop::ChangeStatsWindowEdit(modName.c_str(), i, entry.text.data());
+                            ImGui::EndDisabled();
+                            break;
+                        }
+                        case ModKitInterop::MODKIT_STATS_BUTTON:
+                            ImGui::BeginDisabled(!row.enabled);
+                            if (ImGui::Button(row.label, ImVec2(contentW, 0))) {
+                                ModKitInterop::ClickStatsWindowButton(modName.c_str(), i);
+                                // Whatever was pending has just been submitted -
+                                // see g_statsEditBuffers's own comment.
+                                ClearStatsEditDirty(modName);
+                            }
+                            ImGui::EndDisabled();
+                            break;
+                        case ModKitInterop::MODKIT_STATS_CHECKBOX: {
+                            bool checked = row.checked;
+                            ImGui::BeginDisabled(!row.enabled);
+                            if (ImGui::Checkbox(row.label, &checked))
+                                ModKitInterop::ToggleStatsWindowCheckbox(modName.c_str(), i);
+                            ImGui::EndDisabled();
+                            break;
+                        }
+                        case ModKitInterop::MODKIT_STATS_DROPDOWN: {
+                            ImGui::TextUnformatted(row.label);
+                            ImGui::BeginDisabled(!row.enabled);
+                            ImGui::SetCursorPosX(colX);
+                            ImGui::SetNextItemWidth(contentW);
+                            if (ImGui::BeginCombo("##d", row.valueText)) {
+                                for (int oi = 0; oi < row.dropdownCount; ++oi) {
+                                    char opt[64] = {};
+                                    if (!ModKitInterop::GetStatsWindowDropdownOption(modName.c_str(), i, oi, opt, sizeof(opt)))
+                                        continue;
+                                    bool selected = strcmp(opt, row.valueText) == 0;
+                                    if (ImGui::Selectable(opt, selected)) {
+                                        ModKitInterop::SelectStatsWindowDropdown(modName.c_str(), i, oi);
+                                        // A slot switch makes whatever was
+                                        // pending for the OLD slot moot - see
+                                        // g_statsEditBuffers's own comment.
+                                        ClearStatsEditDirty(modName);
+                                    }
+                                }
+                                ImGui::EndCombo();
+                            }
+                            ImGui::EndDisabled();
+                            break;
+                        }
+                        }
+
+                        ImGui::PopID();
+                        ImGui::Dummy(ImVec2(0, 4));
                     }
 
-                    ImGui::PopID();
+                    maxYReached = (std::max)(maxYReached, ImGui::GetCursorPosY());
                     ImGui::Dummy(ImVec2(0, 4));
+                    cachedH = maxYReached + 4.0f;   // this frame's real measurement, used for NEXT frame's childH
+                    ImGui::EndChild();
                 }
-
-                maxYReached = (std::max)(maxYReached, ImGui::GetCursorPosY());
-                ImGui::SetCursorPosY(maxYReached);
-                ImGui::Dummy(ImVec2(0, 4));
             }
 
             // See DrawOneConfigPanel's identical cascade-advance call.
