@@ -44,6 +44,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <algorithm>
 #include <cstring>
@@ -611,6 +612,22 @@ namespace Overlay {
     // height has to be decided BEFORE its content is drawn, and how this
     // one-frame-stale cache resolves that.
     inline std::unordered_map<std::string, float> g_statsContentHeight;
+
+    // Collapsed Divider labels per stats panel, keyed by modName — mirrors
+    // StatsWindowKit's native-side PanelState::collapsedSections (absent =
+    // expanded). Kept separate per modName since several stats panels can
+    // be open at once, each with its own independent section state.
+    inline std::unordered_map<std::string, std::unordered_set<std::string>> g_statsCollapsedSections;
+
+    // Which modNames have already had their Divider::defaultCollapsed rows
+    // applied to g_statsCollapsedSections. Native has WM_CREATE as a natural
+    // "only the very first build" hook (see NP_HandleMessage); the overlay
+    // has no equivalent one-time event — DrawOneStatsPanel runs every frame
+    // a panel is open — so this set is what makes the seed happen exactly
+    // once per modName rather than on every single frame (which would
+    // otherwise permanently re-collapse a section the instant after the
+    // user expanded it).
+    inline std::unordered_set<std::string> g_statsCollapsedDefaultsApplied;
 
     // ── Anchor window ────────────────────────────────────────────────────
     // ModConfigWindow.h (the per-mod config window, shared native C++ code)
@@ -1333,6 +1350,42 @@ namespace Overlay {
             if (rows[i].type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) columnCount++;
         }
 
+        // One-time seed from each Divider's own defaultCollapsed — see
+        // g_statsCollapsedDefaultsApplied's own comment for why this needs
+        // an explicit "already done" guard, unlike native's WM_CREATE.
+        // Gated on rowCount > 0 so a stray empty-row frame (before a mod's
+        // BuildElements has anything to report yet) can't mark the seed
+        // "done" before it actually ran — the panel keeps retrying every
+        // frame it's open until real rows show up, then seeds exactly once.
+        if (rowCount > 0 && g_statsCollapsedDefaultsApplied.insert(modName).second) {
+            auto& collapsedSet = g_statsCollapsedSections[modName];
+            for (int i = 0; i < rowCount; ++i) {
+                if (rows[i].type == ModKitInterop::MODKIT_STATS_DIVIDER && rows[i].defaultCollapsed)
+                    collapsedSet.insert(rows[i].label);
+            }
+        }
+
+        // Pre-pass identical in shape to StatsWindowKit's own
+        // NP_ComputeHidden: a row is hidden if it falls between a
+        // collapsed Divider and the next Divider/ColumnBreak/end. Unlike
+        // native, nothing needs rebuilding here — ImGui re-lays-out every
+        // frame, so simply not drawing a hidden row (see the main loop
+        // below) is enough for the panel to shrink on its own.
+        std::vector<bool> hiddenRow(rowCount, false);
+        {
+            auto& collapsedSet = g_statsCollapsedSections[modName];
+            bool curHidden = false;
+            for (int i = 0; i < rowCount; ++i) {
+                const auto& r = rows[i];
+                if (r.type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) { curHidden = false; continue; }
+                if (r.type == ModKitInterop::MODKIT_STATS_DIVIDER) {
+                    curHidden = collapsedSet.count(r.label) != 0;
+                    continue;   // the divider header itself always stays visible
+                }
+                hiddenRow[i] = curHidden;
+            }
+        }
+
         const float STATUS_WIDTH = g_lastStatusPanelWidth;
         const float PAD = 10, HEADER_H = 30, GUTTER = 16, COL_W = 300;
         // A mod that emits a column break wants a wide-but-short panel
@@ -1472,6 +1525,8 @@ namespace Overlay {
                             continue;
                         }
 
+                        if (hiddenRow[i]) continue;   // inside a collapsed section — no space, not drawn
+
                         const float colX = PAD + col * (COL_W + GUTTER);
                         ImGui::SetCursorPosX(colX);
                         ImGui::PushID(i);
@@ -1491,19 +1546,36 @@ namespace Overlay {
                             // other widget in this switch, and looks the same
                             // as before in single-column panels since contentW
                             // there is just the full usable width anyway.
+                            bool isCollapsed = g_statsCollapsedSections[modName].count(row.label) != 0;
+                            // Plain ASCII, not a Unicode arrow glyph — this
+                            // overlay's font atlas isn't guaranteed to have
+                            // the box-drawing/geometric-shapes range loaded,
+                            // so a ▶/▼ glyph could just render as a missing-
+                            // glyph box. Matches the native panel's own
+                            // ASCII indicator for the same reason.
+                            std::string dispLabel = std::string(isCollapsed ? "> " : "v ") + row.label;
                             ImVec2 p0 = ImGui::GetCursorScreenPos();
-                            ImVec2 textSize = ImGui::CalcTextSize(row.label);
+                            ImVec2 textSize = ImGui::CalcTextSize(dispLabel.c_str());
                             float lineH = ImGui::GetTextLineHeight();
                             float midY = p0.y + lineH * 0.5f;
                             ImDrawList* dl = ImGui::GetWindowDrawList();
                             const float leadW = 8.0f, gap = 6.0f;
                             dl->AddLine(ImVec2(p0.x, midY), ImVec2(p0.x + leadW, midY), Colors::ACCENT, 1.0f);
-                            dl->AddText(ImVec2(p0.x + leadW + gap, p0.y), Colors::TEXT, row.label);
+                            dl->AddText(ImVec2(p0.x + leadW + gap, p0.y), Colors::TEXT, dispLabel.c_str());
                             float afterX = p0.x + leadW + gap + textSize.x + gap;
                             float rightEdge = p0.x + contentW;
                             if (afterX < rightEdge)
                                 dl->AddLine(ImVec2(afterX, midY), ImVec2(rightEdge, midY), Colors::ACCENT, 1.0f);
-                            ImGui::Dummy(ImVec2(contentW, lineH));
+                            // The whole row is the click target — toggles
+                            // this section's collapsed state, same
+                            // affordance as the native panel's SS_NOTIFY
+                            // divider. InvisibleButton both reserves the
+                            // row's layout space (replacing the old bare
+                            // Dummy call) and reports the click.
+                            if (ImGui::InvisibleButton("##divToggle", ImVec2(contentW, lineH))) {
+                                auto& collapsedSet = g_statsCollapsedSections[modName];
+                                if (isCollapsed) collapsedSet.erase(row.label); else collapsedSet.insert(row.label);
+                            }
                             break;
                         }
                         case ModKitInterop::MODKIT_STATS_BAR: {

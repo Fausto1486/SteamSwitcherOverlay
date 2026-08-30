@@ -89,6 +89,7 @@ namespace ModKitInterop {
         bool enabled;
         bool checked;
         int  dropdownCount;
+        bool defaultCollapsed;   // Divider only — see ModKit.h's own copy of this field
     };
 
     typedef bool (*HasStatsWindow_t)(const char*);
