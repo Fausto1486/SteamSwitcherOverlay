@@ -235,6 +235,32 @@ namespace Overlay {
             if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 st.pos.x += io.MouseDelta.x;
                 st.pos.y += io.MouseDelta.y;
+
+                // Keeps the ENTIRE header on screen at all times, in every
+                // direction — confirmed live, this was previously
+                // unclamped entirely: dragging toward any edge (not just
+                // left) could push the header fully off-screen, at which
+                // point there's no way to grab it again to drag it back,
+                // since the drag target itself is what's now invisible.
+                // headerMin/headerMax are this frame's ALREADY-drawn rect
+                // (one frame behind the position update below), which is
+                // fine — mouse deltas are small per-frame, so clamping
+                // against a one-frame-stale header size is imperceptible,
+                // the same tradeoff g_statsContentHeight's own one-frame
+                // lag already makes elsewhere in this file.
+                ImGuiViewport* vp = ImGui::GetMainViewport();
+                const float headerW = headerMax.x - headerMin.x;
+                const float headerH = headerMax.y - headerMin.y;
+                float minX = vp->WorkPos.x;
+                float maxX = vp->WorkPos.x + vp->WorkSize.x - headerW;
+                float minY = vp->WorkPos.y;
+                float maxY = vp->WorkPos.y + vp->WorkSize.y - headerH;
+                if (maxX < minX) maxX = minX;   // header wider than the screen itself - degenerate, don't invert the clamp
+                if (maxY < minY) maxY = minY;
+                if (st.pos.x < minX) st.pos.x = minX;
+                if (st.pos.x > maxX) st.pos.x = maxX;
+                if (st.pos.y < minY) st.pos.y = minY;
+                if (st.pos.y > maxY) st.pos.y = maxY;
             }
             else {
                 st.dragging = false;
@@ -1293,12 +1319,18 @@ namespace Overlay {
         // Fetched upfront (not lazily per-row like before) so a
         // MODKIT_STATS_COLUMN_BREAK anywhere in the list can decide the
         // window's WIDTH before Begin() - ImGui needs the size up front,
-        // not something discoverable mid-draw.
+        // not something discoverable mid-draw. Counts columns generically
+        // (any number of breaks), not just "was there at least one" - a
+        // second break used to just re-set the SAME "column 2" position
+        // (silently overlapping whatever was already drawn there) instead
+        // of creating a genuine third column; StatsWindowKit's own
+        // AddressDebugRegistry now relies on a real third column actually
+        // working, not just the mod's own single break.
         std::vector<ModKitInterop::ModKitStatsRowView> rows(rowCount);
-        bool hasColumnBreak = false;
+        int columnCount = 1;
         for (int i = 0; i < rowCount; ++i) {
             ModKitInterop::GetStatsWindowRow(modName.c_str(), i, &rows[i]);
-            if (rows[i].type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) hasColumnBreak = true;
+            if (rows[i].type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) columnCount++;
         }
 
         const float STATUS_WIDTH = g_lastStatusPanelWidth;
@@ -1307,9 +1339,12 @@ namespace Overlay {
         // instead of the default narrow-but-tall one - see this row type's
         // own comment in ModKit.h. Everything else about the panel (anchor
         // position, header, close button) stays identical either way.
-        const float WIDTH = hasColumnBreak ? (PAD * 2 + COL_W * 2 + GUTTER) : 320;
-        const float contentW = hasColumnBreak ? COL_W : (WIDTH - PAD * 2);
-        const float col2X = PAD + COL_W + GUTTER;
+        const float naturalWidth = (columnCount > 1)
+            ? (PAD * 2 + COL_W * columnCount + GUTTER * (columnCount - 1))
+            : 320;
+        const float contentW = (columnCount > 1) ? COL_W : (naturalWidth - PAD * 2);
+        // ColX(0) intentionally omitted — column 0 always sits at PAD,
+        // handled directly where colX is computed below.
 
         // See DrawOneConfigPanel's identical block for the shared-cascade
         // auto-dock-until-dragged reasoning - any number of config panels
@@ -1319,6 +1354,24 @@ namespace Overlay {
             if (g_panelDockCursorY < 0.0f) g_panelDockCursorY = ImGui::GetMainViewport()->WorkPos.y + 56;
             panel.drag.pos = ImVec2(ImGui::GetMainViewport()->WorkPos.x + 22 + STATUS_WIDTH + 8, g_panelDockCursorY);
         }
+        // Caps the OUTER window against the screen's right edge, same
+        // reasoning maxContentH already applies to the bottom edge below —
+        // without this, moving the panel toward the left/right edge never
+        // triggered horizontal scrolling at all, regardless of how wide a
+        // multi-column layout (e.g. StatsWindowKit's own debug column)
+        // actually needed to be: naturalWidth was ALSO the window's own
+        // width, with nothing ever narrower than its content to create an
+        // overflow condition for the horizontal scrollbar to detect in the
+        // first place. The BeginChild call further down already has
+        // ImGuiWindowFlags_HorizontalScrollbar set — this is the missing
+        // piece that lets it ever actually trigger: draw the same wide
+        // content (rows still positioned at their natural, uncapped colX)
+        // inside a now-genuinely-narrower window, and ImGui's own overflow
+        // detection does the rest, the same way it already does for height.
+        ImGuiViewport* vpForWidth = ImGui::GetMainViewport();
+        const float maxWindowW = (std::max)(200.0f,
+            vpForWidth->WorkPos.x + vpForWidth->WorkSize.x - panel.drag.pos.x - 20.0f);
+        const float WIDTH = (std::min)(naturalWidth, maxWindowW);
         ImGui::SetNextWindowPos(panel.drag.pos, ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(WIDTH, 0), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(1.0f);
@@ -1407,19 +1460,19 @@ namespace Overlay {
                     // is now measured in the child's own local space, not
                     // the outer window's.
                     float maxYReached = 0.0f;
-                    bool inColumn2 = false;
+                    int col = 0;
 
                     for (int i = 0; i < rowCount; ++i) {
                         const ModKitInterop::ModKitStatsRowView& row = rows[i];
 
                         if (row.type == ModKitInterop::MODKIT_STATS_COLUMN_BREAK) {
                             maxYReached = (std::max)(maxYReached, ImGui::GetCursorPosY());
-                            inColumn2 = true;
-                            ImGui::SetCursorPos(ImVec2(col2X, 0));
+                            col++;
+                            ImGui::SetCursorPos(ImVec2(PAD + col * (COL_W + GUTTER), 0));
                             continue;
                         }
 
-                        const float colX = inColumn2 ? col2X : PAD;
+                        const float colX = PAD + col * (COL_W + GUTTER);
                         ImGui::SetCursorPosX(colX);
                         ImGui::PushID(i);
 
