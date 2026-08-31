@@ -60,6 +60,10 @@ namespace Overlay {
     namespace Colors {
         static const ImU32 BG = Col(18, 18, 22);
         static const ImU32 ACCENT = Col(150, 150, 160);
+        // Header badge for "this game's mod(s) use MonoKit" — same hue as
+        // ModsStatusPanel.cs's MONO_BADGE_TXT, so the signal reads the same
+        // whether the person's looking at Toast mode or the overlay.
+        static const ImU32 MONO_BADGE_TXT = Col(170, 140, 230);
         static const ImU32 TEXT = Col(235, 235, 235);
         static const ImU32 DISABLED_TEXT = Col(130, 130, 130);
         static const ImU32 ROW_HOVER = Col(40, 40, 48);
@@ -327,12 +331,21 @@ namespace Overlay {
         // #F only (ModConfigWindow non-default rows) - kept separate from
         // activeLabels above specifically for the aggregate "hooked" toast's
         // label in DiffAndPushToasts, which must NOT include #G (ordinary
-        // MultiFlagToggleMod feature labels like "Health"/"Stamina") - see
-        // that function's own comment for why, and ModManager.cs's
-        // GetActiveSubFlags (used the same way by Toast mode's own
-        // aggregate-toast label builder, OnPipeHookOverlay) for the C#
-        // side of the same distinction.
+        // MultiFlagToggleMod feature labels like "Health"/"Energy") - those
+        // get their own individual toast per label instead (the per-label
+        // diff loop further down DiffAndPushToasts), so folding them into
+        // this aggregate toast's parenthetical too would show the same
+        // information twice. Matches ModManager.cs's GetActiveSubFlags,
+        // used the same way by Toast mode's own aggregate-toast label
+        // builder, BuildAggregateToastLabel in ModsPanel.cs.
         std::vector<std::string> activeSubFlags;
+        // #P — feature labels currently resolving (any mod, via core's
+        // ModKit_NotifyFeatureBusy — not MonoKit-specific). Diffed in
+        // DiffAndPushToasts to push a "Scanning" toast under the SAME key
+        // ("modName:label") the eventual ON/OFF toast for that same label
+        // uses, so it visually turns into "ON" in place once resolved
+        // rather than being a separate toast that lingers.
+        std::vector<std::string> pendingFeatureLabels;
     };
 
     inline std::vector<ModRow> ReadModRows() {
@@ -345,6 +358,8 @@ namespace Overlay {
             row.hooked = status.hooked;
             row.outdated = status.outdated;
             row.busy = status.busy;
+            row.pendingFeatureLabels = status.pendingFeatureLabels;
+            std::sort(row.pendingFeatureLabels.begin(), row.pendingFeatureLabels.end());
 
             row.activeSubFlags = status.activeSubFlags;
             std::sort(row.activeSubFlags.begin(), row.activeSubFlags.end());
@@ -432,7 +447,7 @@ namespace Overlay {
     };
     inline ToastState g_toasts;
 
-    struct PrevModState { bool hooked = false, outdated = false, busy = false; std::vector<std::string> activeLabels; bool seen = false; };
+    struct PrevModState { bool hooked = false, outdated = false, busy = false; std::vector<std::string> activeLabels; std::vector<std::string> pendingFeatureLabels; bool seen = false; };
     inline std::unordered_map<std::string, PrevModState>& PrevStates() {
         static std::unordered_map<std::string, PrevModState> s;
         return s;
@@ -471,31 +486,35 @@ namespace Overlay {
             // way, since false→false is not a transition.
             if (!p.seen) p.seen = true;
 
-            if (row.busy && !p.busy)
-                g_toasts.Push(row.modName, row.modName, ToastKind::Scanning);
+            // Per-feature "Scanning" toast for MonoKit hooks currently
+            // resolving — keyed "modName:label", the SAME key the per-label
+            // ON/OFF toast just below uses for that same label, so
+            // PushToast's existing refresh-by-key behavior turns this into
+            // "ON" in place once resolved instead of it being a second,
+            // separate toast. NOT gated behind row.busy (the whole-mod
+            // aggregate flag) at all — that one drove a toast here once,
+            // but for a mod like InfiniteParams, MonoKit's Acquire runs a
+            // genuine (if usually near-instant) resolve on every single
+            // toggle, so a mod-level busy toast fired on literally every
+            // press. This is the per-feature #P diff instead — still real
+            // per-toggle "is this specific feature resolving" signal, but
+            // sharing a key with (and so getting replaced by) that
+            // feature's own eventual ON toast rather than sitting as its
+            // own separate, ever-repeating toast.
+            for (auto& lbl : row.pendingFeatureLabels) {
+                if (std::find(p.pendingFeatureLabels.begin(), p.pendingFeatureLabels.end(), lbl) == p.pendingFeatureLabels.end())
+                    g_toasts.Push(row.modName + ":" + lbl, row.modName + " (" + lbl + ")", ToastKind::Scanning);
+            }
 
+            // "ModName (subflag1, subflag2, ...)" from activeSubFlags (#F)
+            // only - ModConfigWindow non-default rows, e.g. a "Watchdog
+            // Mode" toggle sitting away from its default. Deliberately NOT
+            // activeLabels (#F ∪ #G) - #G (MultiFlagToggleMod-style
+            // per-flag hotkeys, e.g. "Health"/"Energy"/"ATB") gets its own
+            // individual toast per label from the diff loop further down,
+            // so folding it into this aggregate toast's parenthetical too
+            // would show the same information twice.
             if (row.hooked != p.hooked) {
-                // Label built from activeSubFlags (#F) ONLY, not the merged
-                // activeLabels (#F ∪ #G) - matches Toast mode's own
-                // aggregate-toast label builder, OnPipeHookOverlay in
-                // ModsPanel.cs, which calls GetActiveSubFlags (#F only) for
-                // exactly this reason. Including #G here (MultiFlagToggleMod's
-                // ordinary feature labels, e.g. "Health"/"Stamina") caused a
-                // visible duplicate: MultiFlagToggleMod::Toggle fires
-                // ModKit_NotifyFeatureActive (writes #G) and, on the specific
-                // frame the mod's AGGREGATE state also flips off→on,
-                // ModKit_NotifyHooked (#H) in the very same call - so this
-                // row's activeLabels already contains the just-turned-on
-                // flag's label by the time the hooked-transition below reads
-                // it, producing "InfiniteParams (Health)" here AND, from the
-                // per-label loop further down (which correctly still uses
-                // the full #F ∪ #G activeLabels - a feature turning on is
-                // newsworthy regardless of which kind of flag it is), a
-                // second, redundant "InfiniteParams (Health)" toast under a
-                // different key. Only reproduces on the specific toggle that
-                // flips the mod's aggregate state, matching exactly what was
-                // reported: fine on every toggle except the one that turns
-                // the whole mod on from fully off.
                 std::string label = row.modName;
                 if (!row.activeSubFlags.empty()) {
                     label += " (";
@@ -508,6 +527,11 @@ namespace Overlay {
             if (row.outdated && !p.outdated)
                 g_toasts.Push(row.modName, row.modName, ToastKind::Outdated);
 
+            // Per-label toast for ordinary multi-flag features (#G) - keyed
+            // "modName:label" specifically so it never touches the
+            // aggregate toast's slot above. Each individually toggled
+            // feature (Health, Energy, ATB, ...) gets and keeps its own
+            // toast this way, independent of how many others are also active.
             for (auto& lbl : row.activeLabels) {
                 if (std::find(p.activeLabels.begin(), p.activeLabels.end(), lbl) == p.activeLabels.end())
                     g_toasts.Push(row.modName + ":" + lbl, row.modName + " (" + lbl + ")", ToastKind::On);
@@ -517,7 +541,20 @@ namespace Overlay {
                     g_toasts.Push(row.modName + ":" + lbl, row.modName + " (" + lbl + ")", ToastKind::Off);
             }
 
-            p.hooked = row.hooked; p.outdated = row.outdated; p.busy = row.busy; p.activeLabels = row.activeLabels;
+            // A label that was pending and now isn't, but also never became
+            // active - a cancel (hotkey pressed again while still
+            // resolving). Dismiss its toast rather than leaving it stuck
+            // showing "Scanning" forever, since nothing else will ever push
+            // to that key again otherwise.
+            for (auto& lbl : p.pendingFeatureLabels) {
+                bool stillPending = std::find(row.pendingFeatureLabels.begin(), row.pendingFeatureLabels.end(), lbl) != row.pendingFeatureLabels.end();
+                bool nowActive = std::find(row.activeLabels.begin(), row.activeLabels.end(), lbl) != row.activeLabels.end();
+                if (!stillPending && !nowActive)
+                    g_toasts.Push(row.modName + ":" + lbl, row.modName + " (" + lbl + ")", ToastKind::Off);
+            }
+
+            p.hooked = row.hooked; p.outdated = row.outdated; p.busy = row.busy;
+            p.activeLabels = row.activeLabels; p.pendingFeatureLabels = row.pendingFeatureLabels;
         }
 
         bool searching = ModKitInterop::IsPoolSearching();
@@ -952,6 +989,27 @@ namespace Overlay {
         return out;
     }
 
+    // MonoKit's own class-pool trampolines — a completely separate pool
+    // from the one PoolInfoText() reports on (see MonoKit.h's own comment
+    // on why: Mono/IL2CPP JIT'd code lives nowhere near the exe, so a
+    // Mono-based mod's hooks never touch ModKit's shared PE-cave pool at
+    // all — PoolInfoText() correctly says "not needed" for such a mod, that
+    // line just isn't the whole picture). Absent (empty string) whenever no
+    // mod in this process has ever called MonoKit::BuildAt, so this adds
+    // nothing to the footer for a non-Mono game.
+    inline std::string MonoPoolInfoText() {
+        int chunks = 0; long long total = 0, used = 0;
+        if (!SharedDataReader::TryReadMonoPoolInfo(chunks, total, used)) return "";
+        char out[96];
+        // Same "X of Y" phrasing as ModsStatusPanel.cs's SetMonoPoolInfo —
+        // this side has no thousands-separator formatting so "X/Y" alone
+        // wouldn't actually be ambiguous here, but matching wording keeps
+        // Toast and Overlay mode reading identically for the same data.
+        snprintf(out, sizeof(out), "MonoKit pool: %d chunk%s, %lld of %lld B used",
+            chunks, chunks == 1 ? "" : "s", used, total);
+        return out;
+    }
+
     inline void DrawStatusPanel(const std::vector<ModRow>& rows) {
         ForceCursorUsable(); // re-assert every frame - see this state's own comment above
 
@@ -1035,6 +1093,23 @@ namespace Overlay {
             winDl->AddRectFilled(ImVec2(winPos.x, winPos.y + infoTop), ImVec2(winPos.x + WIDTH, winPos.y + infoTop + 3), Colors::ACCENT);
             winDl->AddText(ImVec2(winPos.x + PAD, winPos.y + infoTop + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
                 Colors::ACCENT, "MODS - click to configure");
+
+            // Same session-sticky signal ModsStatusPanel.cs's _usesMono
+            // drives its badge from, just read straight off shared memory
+            // here instead of over the pipe — true the moment any mod in
+            // this process has ever published MonoKit pool stats, stays
+            // true for the rest of the session even if that mod's hooks
+            // later get uninstalled.
+            {
+                int mc = 0; long long mt = 0, mu = 0;
+                if (SharedDataReader::TryReadMonoPoolInfo(mc, mt, mu)) {
+                    const char* badge = "MONO";
+                    float bw = ImGui::CalcTextSize(badge).x;
+                    winDl->AddText(ImVec2(winPos.x + WIDTH - PAD - bw, winPos.y + infoTop + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
+                        Colors::MONO_BADGE_TXT, badge);
+                }
+            }
+
             ImGui::SetCursorPos(ImVec2(PAD, infoTop + HEADER_H));
 
             if (rows.empty()) {
@@ -1113,6 +1188,12 @@ namespace Overlay {
             else {
                 std::string info = PoolInfoText();
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_INFO_TXT), "%s", info.c_str());
+
+                std::string monoInfo = MonoPoolInfoText();
+                if (!monoInfo.empty()) {
+                    ImGui::SetCursorPosX(PAD);
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_INFO_TXT), "%s", monoInfo.c_str());
+                }
             }
             ImGui::Dummy(ImVec2(0, 4));
 

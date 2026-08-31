@@ -34,6 +34,7 @@ namespace SharedDataReader {
         bool busy = false;
         std::vector<std::string> activeSubFlags;      // #F — ModConfigWindow non-default rows
         std::vector<std::string> activeFeatureLabels; // #G — ordinary multi-flag features, display-only
+        std::vector<std::string> pendingFeatureLabels; // #P — features currently resolving, see ModKit_NotifyFeatureBusy
     };
 
     inline std::string ReadNullTerminatedAscii(const char* buf, int len) {
@@ -103,6 +104,8 @@ namespace SharedDataReader {
                 status.activeSubFlags = SplitNonEmpty(it->second, ';');
             if (auto it = raw.find(modName + "#G"); it != raw.end() && !it->second.empty())
                 status.activeFeatureLabels = SplitNonEmpty(it->second, ';');
+            if (auto it = raw.find(modName + "#P"); it != raw.end() && !it->second.empty())
+                status.pendingFeatureLabels = SplitNonEmpty(it->second, ';');
             result[modName] = std::move(status);
         }
         return result;
@@ -122,6 +125,34 @@ namespace SharedDataReader {
         try {
             outMethod = std::stoi(parts[0]);
             outSizeBytes = std::stoll(parts[1]);
+        }
+        catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    // MonoKit's own class-pool stats — same "__MONOPOOL__" key MonoKit.h's
+    // PublishPoolStats() writes via ModKit_SetSharedData, mirroring
+    // TryReadPoolInfo above exactly but for MonoKit's pool instead of
+    // ModKit's shared PE-cave/VirtualAlloc one. Absent entirely (returns
+    // false) for any mod that never calls MonoKit::BuildAt — not just
+    // "zero", genuinely not present, so callers can tell "no Mono hooks in
+    // this process" apart from "Mono hooks exist but haven't allocated yet".
+    inline bool TryReadMonoPoolInfo(int& outChunks, long long& outTotalBytes, long long& outUsedBytes) {
+        outChunks = 0; outTotalBytes = 0; outUsedBytes = 0;
+        std::unordered_map<std::string, std::string> raw;
+        if (!ReadRawEntries(raw)) return false;
+
+        auto it = raw.find("__MONOPOOL__");
+        if (it == raw.end()) return false;
+
+        auto parts = SplitNonEmpty(it->second, '|');
+        if (parts.size() < 3) return false;
+        try {
+            outChunks = std::stoi(parts[0]);
+            outTotalBytes = std::stoll(parts[1]);
+            outUsedBytes = std::stoll(parts[2]);
         }
         catch (...) {
             return false;
