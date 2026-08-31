@@ -1241,6 +1241,21 @@ namespace PresentHookKit {
         inline ID3D12CommandQueue* g_capturedQueue = nullptr;
         inline volatile bool g_hasCapturedQueue = false; // matches the extern declared up in DX11's forward-decl block
 
+        // Set true only while OUR OWN probe code (InstallNativePresentHook)
+        // is calling CreateSwapChainForHwnd on a throwaway queue purely to
+        // read a vtable. That call routes through the same hooked
+        // IDXGIFactory2::CreateSwapChainForHwnd as the real game's calls
+        // (it's a shared-function patch, not per-instance), so without this
+        // guard OnSwapChainCreationQueueSeen has no way to tell our
+        // temporary probe queue apart from the game's real one — it would
+        // "authoritatively" capture the probe queue, which gets Release()'d
+        // moments later, leaving g_capturedQueue dangling and faulting
+        // TryInitAndRender the first time it tries to use it. Not
+        // thread-local: Install() runs once, synchronously, from a single
+        // worker thread, same assumption the rest of this file's install
+        // path already makes.
+        inline volatile bool g_suppressQueueCapture = false;
+
         inline bool g_imguiInit = false;
         inline bool g_renderDisabledAfterFault = false;
         // See DX9's identical flag/comment for the full reasoning - a
@@ -1805,6 +1820,7 @@ namespace PresentHookKit {
         // caller guessing needed. Always wins over the ExecuteCommandLists
         // heuristic below if both fire.
         inline void OnSwapChainCreationQueueSeen(IUnknown* pDevice) {
+            if (g_suppressQueueCapture) return; // our own probe's call, not the real game's — see this flag's own comment
             ID3D12CommandQueue* queue = nullptr;
             if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) {
                 Logging::LogFmt("[PresentHookKit] DX12 OnSwapChainCreationQueueSeen: pDevice (0x%p) did NOT QueryInterface to ID3D12CommandQueue — hook fired, but this call's pDevice isn't the queue we expected.", pDevice);
@@ -1867,6 +1883,147 @@ namespace PresentHookKit {
             return g_origExecuteCommandLists(queue, numLists, lists);
         }
 
+        // ── Native D3D12 Present hook ────────────────────────────────────
+        // Replaces the old assumption that DX11's borrowed-vtable Present
+        // hook is a "universal" frame-boundary signal for D3D12 games too.
+        // Confirmed false for ParasiteMutant_Demo: its real swapchain is
+        // D3D12-flip-model and never routes through the D3D11 probe's
+        // vtable, so DX11::HookedPresent never fires for it and
+        // TryInitAndRender() is never called — NOBACKEND after 10s despite
+        // ExecuteCommandLists correctly firing.
+        //
+        // Same shared-function-patch technique as DX11's Present hook
+        // (MinHook patches the function's own code, not a per-instance
+        // vtable slot — fires for every swapchain using that code path,
+        // process-wide, regardless of which specific IDXGISwapChain
+        // instance triggered the initial vtable read). The difference is
+        // the PROBE swapchain is now a genuine flip-model D3D12 swapchain
+        // (pDevice = an ID3D12CommandQueue, DXGI_SWAP_EFFECT_FLIP_DISCARD —
+        // the only mode D3D12 swapchains actually support), so its Present
+        // vtable slot resolves to the real D3D12 present code path instead
+        // of borrowing D3D11's.
+        //
+        // Also fixes the "no real swapchain pointer" half of the late-
+        // injection problem: the hooked Present's own `swapChain` argument
+        // IS the game's actual presentation swapchain, so TryInitAndRender
+        // gets a real object to GetBuffer()/GetDesc() from — no longer
+        // solely dependent on the ExecuteCommandLists queue-only fallback.
+        typedef HRESULT(STDMETHODCALLTYPE* Present_t)(IDXGISwapChain*, UINT, UINT);
+        typedef HRESULT(STDMETHODCALLTYPE* Present1_t)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+        inline Present_t g_origPresent = nullptr;
+        inline Present1_t g_origPresent1 = nullptr;
+        inline bool g_presentHooked = false;
+
+        inline HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+            __try { TryInitAndRender(swapChain); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                Logging::LogFmt("[PresentHookKit] DX12 HookedPresent: TryInitAndRender faulted, continuing to real Present anyway.");
+            }
+            if (!g_origPresent) return DXGI_ERROR_INVALID_CALL;
+            return g_origPresent(swapChain, syncInterval, flags);
+        }
+
+        inline HRESULT STDMETHODCALLTYPE HookedPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* pParams) {
+            __try { TryInitAndRender(swapChain); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                Logging::LogFmt("[PresentHookKit] DX12 HookedPresent1: TryInitAndRender faulted, continuing to real Present1 anyway.");
+            }
+            if (!g_origPresent1) return DXGI_ERROR_INVALID_CALL;
+            return g_origPresent1(swapChain, syncInterval, flags, pParams);
+        }
+
+        // vtable[8]=Present, vtable[22]=Present1 (IDXGISwapChain1 extends
+        // IDXGISwapChain — same fixed COM layout every DXGI version keeps
+        // for compatibility). Both patched independently; a swapchain
+        // that only exposes IDXGISwapChain (no Present1) still gets
+        // covered via vtable[8] alone.
+        inline void PatchDX12PresentIfNew(void** vtable) {
+            if (!vtable) return;
+            if (!g_origPresent) {
+                if (vtable[8] == reinterpret_cast<void*>(&HookedPresent)) {
+                    g_presentHooked = true;
+                }
+                else {
+                    MH_STATUS st = MH_CreateHook(vtable[8], reinterpret_cast<void*>(&HookedPresent),
+                        reinterpret_cast<void**>(&g_origPresent));
+                    if (st == MH_OK && MH_EnableHook(vtable[8]) == MH_OK) {
+                        g_presentHooked = true;
+                        Logging::LogFmt("[PresentHookKit] DX12 native Present hooked via MinHook (vtable[8]).");
+                    }
+                    else {
+                        Logging::LogFmt("[PresentHookKit] DX12 PatchDX12PresentIfNew: MH_CreateHook status=%d on vtable[8]=0x%p", (int)st, vtable[8]);
+                    }
+                }
+            }
+            if (!g_origPresent1) {
+                if (vtable[22] == reinterpret_cast<void*>(&HookedPresent1)) return;
+                MH_STATUS st1 = MH_CreateHook(vtable[22], reinterpret_cast<void*>(&HookedPresent1),
+                    reinterpret_cast<void**>(&g_origPresent1));
+                if (st1 == MH_OK && MH_EnableHook(vtable[22]) == MH_OK) {
+                    g_presentHooked = true;
+                    Logging::LogFmt("[PresentHookKit] DX12 native Present1 hooked via MinHook (vtable[22]).");
+                }
+                else {
+                    Logging::LogFmt("[PresentHookKit] DX12 PatchDX12PresentIfNew: MH_CreateHook status=%d on vtable[22]=0x%p", (int)st1, vtable[22]);
+                }
+            }
+        }
+
+        // Probes every adapter (multi-GPU laptops can resolve Present to
+        // different code per adapter, same reasoning as DX11::Install's
+        // own adapter loop) with a throwaway device+queue+flip-discard
+        // swapchain, purely to read real D3D12 Present/Present1 function
+        // pointers off its vtable. Torn down immediately after patching —
+        // MinHook has already patched the underlying code by then, so the
+        // hook survives this probe object's destruction (same pattern as
+        // DX11::Install's own dummy swapchain).
+        inline bool InstallNativePresentHook() {
+            IDXGIFactory4* factory4 = nullptr;
+            if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4))) || !factory4) return false;
+
+            IDXGIAdapter1* adapter = nullptr;
+            for (UINT i = 0; factory4->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+                ID3D12Device* device = nullptr;
+                if (SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))) && device) {
+                    D3D12_COMMAND_QUEUE_DESC qd = {};
+                    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                    ID3D12CommandQueue* queue = nullptr;
+                    if (SUCCEEDED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) && queue) {
+                        HWND dummyWnd = CreateDummyWindow();
+                        if (dummyWnd) {
+                            DXGI_SWAP_CHAIN_DESC1 desc1 = {};
+                            desc1.BufferCount = 2;
+                            desc1.Width = 4; desc1.Height = 4;
+                            desc1.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                            desc1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                            desc1.SampleDesc.Count = 1;
+                            desc1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; // only mode D3D12 swapchains support
+                            IDXGISwapChain1* sc1 = nullptr;
+                            g_suppressQueueCapture = true;
+                            HRESULT hrSc = factory4->CreateSwapChainForHwnd(queue, dummyWnd, &desc1, nullptr, nullptr, &sc1);
+                            g_suppressQueueCapture = false;
+                            if (SUCCEEDED(hrSc) && sc1) {
+                                void** vtable = *reinterpret_cast<void***>(sc1);
+                                PatchDX12PresentIfNew(vtable);
+                                sc1->Release();
+                            }
+                            else {
+                                Logging::LogFmt("[PresentHookKit] DX12 InstallNativePresentHook: CreateSwapChainForHwnd failed on adapter %u, hr=0x%08X", i, hrSc);
+                            }
+                            DestroyWindow(dummyWnd);
+                        }
+                        queue->Release();
+                    }
+                    device->Release();
+                }
+                adapter->Release();
+            }
+            factory4->Release();
+
+            Logging::LogFmt("[PresentHookKit] DX12 native Present hook: %s", g_presentHooked ? "OK" : "FAILED");
+            return g_presentHooked;
+        }
+
         inline bool Install() {
             if (!EnsureMinHookInitialized()) return false;
 
@@ -1891,11 +2048,17 @@ namespace PresentHookKit {
             dummyQueue->Release();
             dummyDevice->Release();
 
-            // No Present/ResizeBuffers hook here — DX11's vtable-swapped
-            // Present is the universal frame-boundary signal for both
-            // backends (see DX11::HookedPresent's fallback branch calling
-            // DX12::TryInitAndRender). DX12 games still need DX11::Install()
-            // to also run — see InstallWorkerThreadProc.
+            // Native Present/Present1 hook is now the primary frame-boundary
+            // signal for D3D12 games (see InstallNativePresentHook's own
+            // comment) — DX11's borrowed-vtable Present is kept installed
+            // as a secondary/legacy signal (harmless no-op on a real D3D12
+            // swapchain, since swapChain->GetDevice() as ID3D11Device
+            // simply fails there) but is no longer relied on alone.
+            bool presentOk = InstallNativePresentHook();
+            if (!presentOk) {
+                Logging::LogFmt("[PresentHookKit] DX12 native Present hook failed to install — falling back to DX11's borrowed-vtable Present as the only frame-boundary signal (may not fire on a pure-D3D12 game, see this namespace's own header comment).");
+            }
+
             g_installed = execOk;
             Logging::LogFmt("[PresentHookKit] DX12 ExecuteCommandLists hook: %s", execOk ? "OK" : "FAILED");
             return g_installed;
@@ -1928,6 +2091,9 @@ namespace PresentHookKit {
                 g_d3d11Context = nullptr;
                 g_d3d11Device = nullptr;
                 g_device = nullptr;
+                g_origPresent = nullptr;
+                g_origPresent1 = nullptr;
+                g_presentHooked = false;
                 g_installed = false;
                 return;
             }
@@ -1983,6 +2149,9 @@ namespace PresentHookKit {
             if (g_d3d11Device) { g_d3d11Device->Release(); g_d3d11Device = nullptr; }
 
             if (g_device) { g_device->Release(); g_device = nullptr; }
+            g_origPresent = nullptr;
+            g_origPresent1 = nullptr;
+            g_presentHooked = false;
             g_installed = false;
             Logging::LogFmt("[PresentHookKit] DX12::Uninstall: teardown complete.");
         }

@@ -1027,6 +1027,20 @@ namespace Overlay {
         bool hasInfo = HasInfoBlock(sess);
         std::string profileText = hasInfo ? DisplayProfileText(sess.profileName) : "";
         std::string timeText = hasInfo ? FormatElapsed(sess.launchEpochMs) : "";
+
+        // Footer text (trampoline pool / MonoKit pool lines) - computed here,
+        // BEFORE WIDTH is decided below, so a long line (e.g. a large
+        // VirtualAlloc trampoline size, or a MonoKit pool with several
+        // chunks) can widen the panel instead of being silently clipped by
+        // the fixed-width NoResize window it's drawn into further down.
+        // searching/clearing states pre-empt the footer entirely (see the
+        // draw call below) and are short fixed strings that never need
+        // extra width, so they're excluded from this measurement on purpose.
+        bool poolSearching = ModKitInterop::IsPoolSearching();
+        bool poolClearing = ModKitInterop::IsPoolClearing();
+        std::string poolInfoText = (poolSearching || poolClearing) ? std::string() : PoolInfoText();
+        std::string monoInfoText = (poolSearching || poolClearing) ? std::string() : MonoPoolInfoText();
+
         float WIDTH = WIDTH_BASE;
         if (hasInfo) {
             float line1 = PAD + ImGui::CalcTextSize(sess.gameName.c_str()).x + 8 + LOGS_BTN_W + PAD;
@@ -1036,8 +1050,12 @@ namespace Overlay {
                     + ImGui::CalcTextSize(timeText.c_str()).x + PAD;
                 WIDTH = (std::max)(WIDTH, line2);
             }
-            WIDTH = (std::min)(WIDTH, MAX_WIDTH);
         }
+        if (!poolInfoText.empty())
+            WIDTH = (std::max)(WIDTH, PAD + ImGui::CalcTextSize(poolInfoText.c_str()).x + PAD);
+        if (!monoInfoText.empty())
+            WIDTH = (std::max)(WIDTH, PAD + ImGui::CalcTextSize(monoInfoText.c_str()).x + PAD);
+        WIDTH = (std::min)(WIDTH, MAX_WIDTH);
         float infoTop = hasInfo ? INFO_H : 0.0f;
         g_lastStatusPanelWidth = WIDTH;
 
@@ -1179,20 +1197,16 @@ namespace Overlay {
             }
 
             ImGui::SetCursorPosX(PAD);
-            bool searching = ModKitInterop::IsPoolSearching();
-            bool clearing = ModKitInterop::IsPoolClearing();
-            if (searching || clearing) {
+            if (poolSearching || poolClearing) {
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_SEARCH_TXT), "%s",
-                    searching ? "searching for trampoline..." : "clearing trampoline...");
+                    poolSearching ? "searching for trampoline..." : "clearing trampoline...");
             }
             else {
-                std::string info = PoolInfoText();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_INFO_TXT), "%s", info.c_str());
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_INFO_TXT), "%s", poolInfoText.c_str());
 
-                std::string monoInfo = MonoPoolInfoText();
-                if (!monoInfo.empty()) {
+                if (!monoInfoText.empty()) {
                     ImGui::SetCursorPosX(PAD);
-                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_INFO_TXT), "%s", monoInfo.c_str());
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(Colors::POOL_INFO_TXT), "%s", monoInfoText.c_str());
                 }
             }
             ImGui::Dummy(ImVec2(0, 4));
