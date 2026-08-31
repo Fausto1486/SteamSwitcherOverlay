@@ -1155,7 +1155,40 @@ namespace Overlay {
         int rowCount = ModKitInterop::GetConfigWindowRowCount(modName.c_str());
 
         const float STATUS_WIDTH = g_lastStatusPanelWidth; // stays aligned with DrawStatusPanel's own dynamic WIDTH
-        const float WIDTH = 280, PAD = 10, HEADER_H = 30, GUTTER = 12;
+        const float WIDTH_BASE = 280, MAX_WIDTH = 480, PAD = 10, HEADER_H = 30, GUTTER = 12;
+
+        // Dynamic width, same pattern as DrawStatusPanel's own WIDTH above:
+        // widen past WIDTH_BASE (up to MAX_WIDTH) when a row's label
+        // wouldn't otherwise fit — a fixed 280 clipped a long Toggle label
+        // in practice, cut off mid-sentence, with no way to reach the rest.
+        // Requires a pass over the rows before Begin() (ImGui needs the
+        // size decided via SetNextWindowSize before the window opens), so
+        // GetConfigWindowRow ends up called twice per row this frame —
+        // cheap, same trade-off DrawStatusPanel already accepts.
+        float WIDTH = WIDTH_BASE;
+        for (int i = 0; i < rowCount; ++i) {
+            ModKitInterop::ModKitConfigRowView row = {};
+            if (!ModKitInterop::GetConfigWindowRow(modName.c_str(), i, &row)) continue;
+
+            float labelW = ImGui::CalcTextSize(row.label).x;
+            float needed;
+            switch (row.type) {
+            case ModKitInterop::MODKIT_ROW_TOGGLE:
+                needed = PAD + labelW + 40 + PAD; // label + gap + checkbox + pad
+                break;
+            case ModKitInterop::MODKIT_ROW_STATUS:
+                needed = PAD + ImGui::CalcTextSize(row.valueText).x + PAD;
+                break;
+            default:
+                // Float/Int/Dropdown: label sits above a full-width input,
+                // so only the label itself (not the input box) can force
+                // extra width here.
+                needed = PAD + labelW + PAD;
+                break;
+            }
+            WIDTH = (std::max)(WIDTH, needed);
+        }
+        WIDTH = (std::min)(WIDTH, MAX_WIDTH);
 
         // Auto-docked in the shared cascade column every frame until the
         // user drags it away (UpdatePanelDrag, called below once the
