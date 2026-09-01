@@ -54,6 +54,23 @@
 //                                         pointer-width-specific format).
 //                                         Sent once, right alongside
 //                                         SETMODCHANNEL|1/GAMEINFO.
+//   RUNTIMEKIND|<mono|il2cpp>           — SteamSwitcher's own process-level
+//                                         Mono/IL2CPP detection (see
+//                                         MonoRuntimeDetector.cs), sent
+//                                         independent of ModKit or any mod —
+//                                         this DLL is already loaded and
+//                                         listening the moment injection
+//                                         starts, so it doesn't need to
+//                                         borrow ModKit.dll off disk the way
+//                                         reaching ModKit's own shared-memory
+//                                         block does (see
+//                                         SharedDataReader::TryReadDetectedRuntime,
+//                                         kept as a secondary fallback —
+//                                         this is the primary path). Sent
+//                                         via SendWithRetry, same reasoning
+//                                         as SETMODCHANNEL: the pipe server
+//                                         may not be listening the instant
+//                                         DllMain returns.
 //
 // Extend the dispatch table below as real Channel-1 use cases emerge —
 // don't over-design placeholder message types now, per the blueprint.
@@ -74,6 +91,7 @@ namespace OverlayPipe {
     inline void (*g_onCloseConfigWindows)() = nullptr;
     inline void (*g_onGameInfo)(const std::string& gameName, int64_t launchEpochMs, const std::string& profileName) = nullptr;
     inline void (*g_onGameHwnd)(HWND hwnd) = nullptr;
+    inline void (*g_onRuntimeKind)(const std::string& kind) = nullptr;
 
     // StartsWith dispatch, one callback per message type — same shape as
     // ModPipeMonitor.cs/CmdPipeThread elsewhere in this codebase, per the
@@ -124,6 +142,16 @@ namespace OverlayPipe {
             if (g_onGameHwnd) g_onGameHwnd(hwnd);
             Logging::LogFmt("[OverlayPipe] GAMEHWND: 0x%p", hwnd);
         }
+        else if (msg.rfind("RUNTIMEKIND|", 0) == 0) {
+            std::string kind = msg.substr(12);
+            if (kind == "mono" || kind == "il2cpp") {
+                if (g_onRuntimeKind) g_onRuntimeKind(kind);
+                Logging::LogFmt("[OverlayPipe] RUNTIMEKIND: %s", kind.c_str());
+            }
+            else {
+                Logging::LogFmt("[OverlayPipe] RUNTIMEKIND: ignoring unrecognized value \"%s\"", kind.c_str());
+            }
+        }
         else {
             Logging::LogFmt("[OverlayPipe] Unrecognized message: %s", msg.c_str());
         }
@@ -167,7 +195,8 @@ namespace OverlayPipe {
     inline void Start(void (*onSetModChannel)(bool), void (*onToast)(const std::string&),
         void (*onCloseConfigWindows)(),
         void (*onGameInfo)(const std::string&, int64_t, const std::string&),
-        void (*onGameHwnd)(HWND))
+        void (*onGameHwnd)(HWND),
+        void (*onRuntimeKind)(const std::string&))
     {
         if (g_running) return;
         g_onSetModChannel = onSetModChannel;
@@ -175,6 +204,7 @@ namespace OverlayPipe {
         g_onCloseConfigWindows = onCloseConfigWindows;
         g_onGameInfo = onGameInfo;
         g_onGameHwnd = onGameHwnd;
+        g_onRuntimeKind = onRuntimeKind;
         g_running = true;
         HANDLE h = CreateThread(nullptr, 0, ServerThreadProc, nullptr, 0, nullptr);
         if (h) {

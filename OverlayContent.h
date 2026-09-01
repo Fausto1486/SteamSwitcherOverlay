@@ -163,6 +163,39 @@ namespace Overlay {
     };
     inline SessionInfo g_session;
 
+    // ── Detected runtime kind — set by OverlayPipe's RUNTIMEKIND message
+    // (SteamSwitcher's own process-level Mono/IL2CPP scan, sent over this
+    // DLL's own pipe the moment it's injected — independent of ModKit or
+    // any mod, since this DLL is loaded regardless of whether either is
+    // ever used), read every frame by DrawStatusPanel's MONO badge check.
+    // Same lock+Set/Get pattern as SessionInfo above, for the same reason
+    // — never hold the lock while calling into ImGui. Deliberately the
+    // ONLY source that badge reads now — an earlier version also checked
+    // ModKit's shared memory (TryReadMonoPoolInfo/TryReadDetectedRuntime)
+    // as a fallback, but "is this a Mono game" shouldn't depend on whether
+    // modding infrastructure happens to be present at all, so that
+    // coupling was removed rather than kept "just in case".
+    struct RuntimeInfo {
+        std::string kind; // "mono", "il2cpp", or empty
+        CRITICAL_SECTION lock;
+
+        RuntimeInfo() { InitializeCriticalSection(&lock); }
+        ~RuntimeInfo() { DeleteCriticalSection(&lock); }
+
+        void Set(const std::string& k) {
+            EnterCriticalSection(&lock);
+            kind = k;
+            LeaveCriticalSection(&lock);
+        }
+        std::string Get() {
+            EnterCriticalSection(&lock);
+            std::string k = kind;
+            LeaveCriticalSection(&lock);
+            return k;
+        }
+    };
+    inline RuntimeInfo g_runtimeInfo;
+
     inline bool HasInfoBlock(const SessionInfo::Snapshot& s) { return !s.gameName.empty(); }
 
     // Last width DrawStatusPanel actually rendered at, so DrawConfigPanel
@@ -1112,20 +1145,26 @@ namespace Overlay {
             winDl->AddText(ImVec2(winPos.x + PAD, winPos.y + infoTop + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
                 Colors::ACCENT, "MODS - click to configure");
 
-            // Same session-sticky signal ModsStatusPanel.cs's _usesMono
-            // drives its badge from, just read straight off shared memory
-            // here instead of over the pipe — true the moment any mod in
-            // this process has ever published MonoKit pool stats, stays
-            // true for the rest of the session even if that mod's hooks
-            // later get uninstalled.
-            {
-                int mc = 0; long long mt = 0, mu = 0;
-                if (SharedDataReader::TryReadMonoPoolInfo(mc, mt, mu)) {
-                    const char* badge = "MONO";
-                    float bw = ImGui::CalcTextSize(badge).x;
-                    winDl->AddText(ImVec2(winPos.x + WIDTH - PAD - bw, winPos.y + infoTop + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
-                        Colors::MONO_BADGE_TXT, badge);
-                }
+            // MONO badge — pure process-level detection, nothing else.
+            // g_runtimeInfo is set by OverlayPipe's RUNTIMEKIND message
+            // (SteamSwitcher's own scan, sent the moment this DLL is
+            // injected — see MonoRuntimeDetector.cs), independent of
+            // whether ModKit or any mod is ever used. Deliberately not
+            // also checking SharedDataReader::TryReadMonoPoolInfo here —
+            // that reflects a MonoKit-based mod actively hooking something,
+            // a real but *different* fact ("a mod is using Mono-aware
+            // hooking") from what this badge means ("this game happens to
+            // be Mono/IL2CPP"). Folding it in here would make the badge's
+            // source ambiguous for no benefit, since the injector's scan
+            // always runs before any mod could possibly resolve anything
+            // via MonoKit anyway. That mod-activity fact still has its own,
+            // separate, correctly ModKit-coupled place — the "MonoKit
+            // pool: ..." footer line (MonoPoolInfoText, further down).
+            if (!g_runtimeInfo.Get().empty()) {
+                const char* badge = "MONO";
+                float bw = ImGui::CalcTextSize(badge).x;
+                winDl->AddText(ImVec2(winPos.x + WIDTH - PAD - bw, winPos.y + infoTop + 4 + (HEADER_H - 4 - ImGui::GetTextLineHeight()) / 2),
+                    Colors::MONO_BADGE_TXT, badge);
             }
 
             ImGui::SetCursorPos(ImVec2(PAD, infoTop + HEADER_H));

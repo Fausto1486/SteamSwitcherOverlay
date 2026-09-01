@@ -97,6 +97,15 @@ namespace {
         PresentHookKit::SetConfirmedGameHwnd(hwnd);
     }
 
+    void OnRuntimeKind(const std::string& kind) {
+        // See OverlayContent.h's own RuntimeInfo comment - this is the only
+        // path feeding the status panel's MONO badge, reached over this
+        // DLL's own pipe rather than through ModKit's shared memory on
+        // purpose: detecting what kind of game this is shouldn't depend on
+        // whether modding infrastructure happens to be present at all.
+        Overlay::g_runtimeInfo.Set(kind);
+    }
+
     DWORD WINAPI StartupWorkerThreadProc(LPVOID) {
         // No PID-guard check here — see this file's own header comment.
         // Under production (SteamSwitcher's own LoadLibraryA), the OS
@@ -110,7 +119,7 @@ namespace {
         // review — see OVERLAY-REDESIGN-RESULT.md.
         Logging::LogFmt("[SteamSwitcherOverlay] Startup worker running, pid=%lu", GetCurrentProcessId());
         HotkeyPoll::Start(&OnHotkeyToggle);
-        OverlayPipe::Start(&OnSetModChannel, &OnToast, &OnCloseConfigWindows, &OnGameInfo, &OnGameHwnd);
+        OverlayPipe::Start(&OnSetModChannel, &OnToast, &OnCloseConfigWindows, &OnGameInfo, &OnGameHwnd, &OnRuntimeKind);
         PresentHookKit::InstallAll();
         return 0;
     }

@@ -2328,12 +2328,29 @@ namespace PresentHookKit {
         // MH_Uninitialize() handles all hooks now — Present/ResizeBuffers
         // are back to MinHook-managed (see this file's own header comment
         // on why vtable-swap was reverted), same as ExecuteCommandLists.
-        // Left unconditional — this only patches/restores instruction
-        // bytes via VirtualProtect, no device/GPU/thread interaction, so
-        // it doesn't carry the same process-terminating risk as the D3D
-        // cleanup below.
-        MH_Uninitialize();
-        Logging::LogFmt("[PresentHookKit] UninstallAll: MH_Uninitialize done.");
+        //
+        // Skipped on process-terminating, same reasoning as the D3D
+        // cleanup below — the comment here used to argue this call was
+        // safe regardless because it "only patches/restores instruction
+        // bytes via VirtualProtect, no device/GPU/thread interaction."
+        // That's wrong: MH_Uninitialize() suspends every other thread in
+        // the process (standard MinHook behavior — it freezes threads
+        // before patching hooked bytes back, specifically so none of them
+        // can be caught mid-execution inside the hooked region) before it
+        // touches anything. During process termination, other threads may
+        // already be forcibly killed or mid-teardown by the OS; suspending
+        // and resuming a thread in that state is exactly the kind of
+        // cross-thread synchronization Microsoft's own DllMain guidance
+        // warns DLL_PROCESS_DETACH-on-terminate away from — the same
+        // reasoning that already applies to the D3D calls just below, just
+        // via thread suspension instead of COM. The OS reclaims the
+        // process's code pages regardless once it actually dies, so
+        // leaving the hooks "installed" for the brief remainder of
+        // termination isn't a leak in any meaningful sense.
+        if (!processTerminating) {
+            MH_Uninitialize();
+            Logging::LogFmt("[PresentHookKit] UninstallAll: MH_Uninitialize done.");
+        }
 
         // processTerminating=true (see DllMain's own comment on lpReserved)
         // skips all D3D/COM cleanup below — confirmed via two separate
